@@ -11,12 +11,11 @@ ARG SVT_AV1_VERSION
 ARG SVT_AV1_HDR_VERSION
 ARG FFMS2_VERSION
 ARG RUST_VERSION
+ARG TARGETARCH
 
 RUN apk add --no-cache \
         build-base \
         cmake \
-        nasm \
-        yasm \
         git \
         curl \
         pkgconf \
@@ -26,6 +25,8 @@ RUN apk add --no-cache \
         ffmpeg-dev \
         zlib-dev \
         ca-certificates
+# nasm/yasm are x86-only assemblers; SVT-AV1 uses NEON on arm64 instead
+RUN [ "$TARGETARCH" != "amd64" ] || apk add --no-cache nasm yasm
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
@@ -37,7 +38,7 @@ RUN git clone --depth 1 --branch ${SVT_AV1_VERSION} \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
         -DBUILD_SHARED_LIBS=OFF \
-        -DENABLE_AVX512=ON \
+        -DENABLE_AVX512=$([ "$TARGETARCH" = "amd64" ] && echo ON || echo OFF) \
         -DNATIVE=OFF && \
     cmake --build /svt-av1/build --parallel $(nproc) && \
     cmake --install /svt-av1/build && \
@@ -49,7 +50,7 @@ RUN git clone --depth 1 --branch ${SVT_AV1_HDR_VERSION} \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local/hdr \
         -DBUILD_SHARED_LIBS=OFF \
-        -DENABLE_AVX512=ON \
+        -DENABLE_AVX512=$([ "$TARGETARCH" = "amd64" ] && echo ON || echo OFF) \
         -DNATIVE=OFF && \
     cmake --build /svt-av1-hdr/build --parallel $(nproc) && \
     cmake --install /svt-av1-hdr/build && \
@@ -73,9 +74,9 @@ COPY src ./src
 
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 ENV RUSTFLAGS="-C target-feature=-crt-static"
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
+    --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
+    --mount=type=cache,target=/src/target,id=cargo-target-${TARGETARCH} \
     cargo build --release && \
     cp /src/target/release/avxs /avxs
 
@@ -93,8 +94,8 @@ COPY --from=builder /usr/local/bin/ffmsindex         /usr/local/bin/ffmsindex
 COPY --from=builder /avxs                             /usr/local/bin/avxs
 # libffms2.so is not in Alpine's package manager — copy from builder
 COPY --from=builder /usr/local/lib/libffms2.so*      /usr/local/lib/
-# Add /usr/local/lib to musl dynamic linker search path
-RUN printf '/lib\n/usr/lib\n/usr/local/lib\n' > /etc/ld-musl-x86_64.path
+# Add /usr/local/lib to musl dynamic linker search path (filename is arch-specific)
+RUN printf '/lib\n/usr/lib\n/usr/local/lib\n' > /etc/ld-musl-$(uname -m).path
 
 VOLUME ["/input", "/output"]
 
