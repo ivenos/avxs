@@ -1,0 +1,48 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:base"],
+  "packageRules": [
+    {
+      "matchManagers": ["cargo"],
+      "automerge": true
+    }
+  ],
+  "regexManagers": [
+    {
+      "fileMatch": ["Dockerfile"],
+      "matchStrings": [
+        "ARG SVT_AV1_VERSION=(?<currentValue>[^\\n]+)"
+      ],
+      "datasourceTemplate": "gitlab-releases",
+      "depNameTemplate": "AOMediaCodec/SVT-AV1",
+      "versioningTemplate": "semver"
+    },
+    {
+      "fileMatch": ["Dockerfile"],
+      "matchStrings": [
+        "ARG SVT_AV1_HDR_VERSION=(?<currentValue>[^\\n]+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "juliobbv-p/svt-av1-hdr",
+      "versioningTemplate": "semver"
+    },
+    {
+      "fileMatch": ["Dockerfile"],
+      "matchStrings": [
+        "ARG FFMS2_VERSION=(?<currentValue>[^\\n]+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "FFMS/ffms2",
+      "versioningTemplate": "loose"
+    },
+    {
+      "fileMatch": ["Dockerfile"],
+      "matchStrings": [
+        "ARG RUST_VERSION=(?<currentValue>[^\\n]+)"
+      ],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "rust",
+      "versioningTemplate": "semver"
+    }
+  ]
+}

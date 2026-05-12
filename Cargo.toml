@@ -1,0 +1,31 @@
+[package]
+name = "avxs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[[bin]]
+name = "avxs"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { version = "1.52",  features = ["rt-multi-thread", "time", "process", "macros", "sync"] }
+serde              = { version = "1.0",   features = ["derive"] }
+serde_json         = "1.0"
+toml               = "1.1"
+anyhow             = "1.0"
+av-scenechange     = "0.23"
+y4m                = "0.8"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3",  features = ["fmt", "env-filter"] }
+walkdir            = "2.5"
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = true
+panic         = "abort"

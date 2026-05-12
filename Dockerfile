@@ -1,0 +1,105 @@
+# syntax=docker/dockerfile:1
+
+ARG SVT_AV1_VERSION=v4.1.0
+ARG SVT_AV1_HDR_VERSION=v4.1.0
+ARG FFMS2_VERSION=5.0
+ARG RUST_VERSION=1.95.0
+
+FROM alpine:3.23 AS builder
+
+ARG SVT_AV1_VERSION
+ARG SVT_AV1_HDR_VERSION
+ARG FFMS2_VERSION
+ARG RUST_VERSION
+
+RUN apk add --no-cache \
+        build-base \
+        cmake \
+        nasm \
+        yasm \
+        git \
+        curl \
+        pkgconf \
+        autoconf \
+        automake \
+        libtool \
+        ffmpeg-dev \
+        zlib-dev \
+        ca-certificates
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN git clone --depth 1 --branch ${SVT_AV1_VERSION} \
+        https://gitlab.com/AOMediaCodec/SVT-AV1.git /svt-av1 && \
+    cmake -B /svt-av1/build /svt-av1 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DENABLE_AVX512=ON \
+        -DNATIVE=OFF && \
+    cmake --build /svt-av1/build --parallel $(nproc) && \
+    cmake --install /svt-av1/build && \
+    rm -rf /svt-av1
+
+RUN git clone --depth 1 --branch ${SVT_AV1_HDR_VERSION} \
+        https://github.com/juliobbv-p/svt-av1-hdr.git /svt-av1-hdr && \
+    cmake -B /svt-av1-hdr/build /svt-av1-hdr \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local/hdr \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DENABLE_AVX512=ON \
+        -DNATIVE=OFF && \
+    cmake --build /svt-av1-hdr/build --parallel $(nproc) && \
+    cmake --install /svt-av1-hdr/build && \
+    rm -rf /svt-av1-hdr
+
+# Build FFMS2 as a shared library to avoid C++ static-init crashes when
+# embedded in a Rust binary
+RUN git clone --depth 1 --branch ${FFMS2_VERSION} \
+        https://github.com/FFMS/ffms2.git /ffms2 && \
+    cd /ffms2 && \
+    mkdir -p src/config && \
+    autoreconf -fiv && \
+    ./configure --prefix=/usr/local --enable-shared=yes --enable-static=no && \
+    make -j$(nproc) && \
+    make install && \
+    rm -rf /ffms2
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release && \
+    cp /src/target/release/avxs /avxs
+
+FROM alpine:3.23 AS runtime
+
+RUN apk add --no-cache \
+        ffmpeg \
+        mkvtoolnix \
+        libstdc++ \
+        libgcc
+
+COPY --from=builder /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1EncApp
+COPY --from=builder /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
+COPY --from=builder /usr/local/bin/ffmsindex         /usr/local/bin/ffmsindex
+COPY --from=builder /avxs                             /usr/local/bin/avxs
+# libffms2.so is not in Alpine's package manager — copy from builder
+COPY --from=builder /usr/local/lib/libffms2.so*      /usr/local/lib/
+# Add /usr/local/lib to musl dynamic linker search path
+RUN printf '/lib\n/usr/lib\n/usr/local/lib\n' > /etc/ld-musl-x86_64.path
+
+VOLUME ["/input", "/output"]
+
+ENV AVXS_INPUT_DIR=/input
+ENV AVXS_OUTPUT_DIR=/output
+ENV AVXS_POLL_INTERVAL=60
+
+ENTRYPOINT ["/usr/local/bin/avxs"]

@@ -1,0 +1,9 @@
+services:
+  avxs:
+    image: ghcr.io/ivenos/avxs:latest
+    volumes:
+      - ./input:/input
+      - ./output:/output
+    environment:
+      - AVXS_POLL_INTERVAL=60
+    restart: unless-stopped

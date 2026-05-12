@@ -1,0 +1,6 @@
+/target/
+*.ffindex
+*.ivf
+/input/
+/output/
+/test/
