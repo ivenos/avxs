@@ -15,11 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Update BSL Change Date
-        run: |
-          NEW_DATE=$(date -d "+4 years" +%Y-%m-%d)
-          sed -i "s/^Change Date:.*/Change Date:          $NEW_DATE/" LICENSE
-
       - name: Update Cargo.toml version
         run: |
           VERSION="${{ github.event.inputs.version }}"
@@ -29,7 +24,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add LICENSE Cargo.toml
+          git add Cargo.toml
           git diff --staged --quiet || git commit -m "chore: release ${{ github.event.inputs.version }}"
           git tag ${{ github.event.inputs.version }}
           git push origin main
