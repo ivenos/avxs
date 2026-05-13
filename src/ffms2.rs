@@ -5,6 +5,7 @@ use std::ffi::CString;
 use std::io::Write;
 use std::os::raw::{c_char, c_double, c_int, c_uint};
 use std::path::Path;
+use std::sync::Once;
 
 const FFMS_ERROR_BUFFER_SIZE: usize = 1024;
 const FFMS_SEEK_NORMAL: c_int = 1; // FFMS2 5.0: enum shifted, 1 = SEEK_NORMAL (supports random access)
@@ -282,9 +283,11 @@ impl Drop for Index {
     }
 }
 
+static FFMS_INIT: Once = Once::new();
+
 impl Index {
     fn read(index_path: &Path) -> Result<Self> {
-        unsafe { FFMS_Init(0, 0) };
+        FFMS_INIT.call_once(|| unsafe { FFMS_Init(0, 0) });
         let path_str = index_path.to_str()
             .with_context(|| format!("non-UTF8 index path: {}", index_path.display()))?;
         let cpath = CString::new(path_str)
@@ -522,8 +525,9 @@ pub async fn run_ffmsindex(source_file: &Path, index_file: &Path) -> Result<()> 
         .context("start ffmsindex")?;
 
     if !out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("ffmsindex failed:\n{stderr}");
+        bail!("ffmsindex failed:\n{stdout}{stderr}");
     }
     Ok(())
 }

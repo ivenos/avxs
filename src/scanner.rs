@@ -8,6 +8,15 @@ pub struct Job {
     pub source_file: PathBuf,
 }
 
+impl Job {
+    pub fn stem(&self) -> &str {
+        self.source_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video")
+    }
+}
+
 pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
     let mut jobs = Vec::new();
 

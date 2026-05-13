@@ -47,11 +47,7 @@ async fn main() -> Result<()> {
             Ok(jobs) => {
                 tracing::info!("{} job(s) queued", jobs.len());
                 for j in &jobs {
-                    let stem = j
-                        .source_file
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("video");
+                    let stem = j.stem();
 
                     if let Err(e) = job::run(j, &ctx).await {
                         job::handle_failure(j, &ctx, stem, &e);
@@ -81,18 +77,22 @@ fn env_path(var: &str, default: &str) -> PathBuf {
 }
 
 fn env_u64(var: &str, default: u64) -> u64 {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(var) {
+        Err(_) => default,
+        Ok(v) => match v.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!("{var} has invalid value {v:?} — using default {default}");
+                default
+            }
+        },
+    }
 }
 
 fn ensure_dirs(input_dir: &std::path::Path, output_dir: &std::path::Path) -> Result<()> {
     for dir in [input_dir, output_dir] {
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("create directory: {}", dir.display()))?;
-        }
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create directory: {}", dir.display()))?;
     }
     Ok(())
 }

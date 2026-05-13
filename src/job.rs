@@ -21,7 +21,7 @@ pub struct JobContext {
 pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let config = Arc::new(Config::from_file(&job.encode_toml)?);
 
-    let stem = job.source_file.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+    let stem = job.stem();
 
     wait_for_stable(&job.source_file, stem).await?;
 
@@ -142,7 +142,14 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     {
         let mut args = config.encoder_args();
-        args.extend(encode_opts.hdr_args.iter().cloned());
+        for pair in encode_opts.hdr_args.chunks(2) {
+            if let [flag, value] = pair {
+                if !config.encoder_params.contains_key(flag.trim_start_matches('-')) {
+                    args.push(flag.clone());
+                    args.push(value.clone());
+                }
+            }
+        }
         if let Some(ki) = encode_opts.keyint {
             if !config.encoder_params.contains_key("keyint") {
                 args.extend_from_slice(&["--keyint".into(), ki.to_string()]);
@@ -372,27 +379,30 @@ fn round_down_even(v: u32) -> u32 {
 // File stability check
 // ---------------------------------------------------------------------------
 
-/// Waits until the file size is stable (two consecutive checks 2 s apart are equal).
-/// Only logs if the file is actually still growing. Times out after 300 s.
+/// Waits until the file size is stable (two consecutive checks are equal).
+/// Uses a short 200 ms initial check so already-complete files return immediately.
+/// Falls back to 2 s polling when the file is actively being written. Times out after 300 s.
 async fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
     const TIMEOUT_SECS: u64 = 300;
+
+    let s0 = file_size(path);
+    if s0 == 0 {
+        bail!("file is empty or missing: {}", path.display());
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    if file_size(path) == s0 {
+        return Ok(());
+    }
+
+    tracing::info!("[{stem}] file is still being written — waiting...");
     let deadline = tokio::time::Instant::now()
         + tokio::time::Duration::from_secs(TIMEOUT_SECS);
-    let mut logged = false;
 
     loop {
         let s1 = file_size(path);
-        if s1 == 0 {
-            bail!("file is empty or missing: {}", path.display());
-        }
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        let s2 = file_size(path);
-        if s1 == s2 {
+        if file_size(path) == s1 {
             return Ok(());
-        }
-        if !logged {
-            tracing::info!("[{stem}] file is still being written — waiting...");
-            logged = true;
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(

@@ -132,14 +132,13 @@ pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
         .map(|f| f.side_data_list)
         .unwrap_or_default();
 
-    let side_types: String = side_data.iter()
-        .map(|s| s.side_data_type.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let has_side_type = |needle: &str| {
+        side_data.iter().any(|s| s.side_data_type.to_lowercase().contains(needle))
+    };
 
-    info.hdr_type = if side_types.contains("dovi") || side_types.contains("dolby") {
+    info.hdr_type = if has_side_type("dovi") || has_side_type("dolby") {
         "Dolby Vision".into()
-    } else if side_types.contains("hdr10+") || side_types.contains("hdr_dynamic") {
+    } else if has_side_type("hdr10+") || has_side_type("hdr_dynamic") {
         "HDR10+".into()
     } else if stream.color_transfer == "smpte2084" {
         "HDR10".into()

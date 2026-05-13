@@ -36,24 +36,28 @@ struct FfprobeDisposition {
     #[serde(default)] visual_impaired: i32,
     #[serde(default)] original: i32,
     #[serde(default)] comment: i32,
-    #[serde(default)] dub: i32,
 }
 
 impl FfprobeDisposition {
-    fn to_ffmpeg_flags(&self) -> String {
-        let flags: Vec<&str> = [
-            (self.default != 0,          "default"),
-            (self.forced != 0,           "forced"),
-            (self.hearing_impaired != 0, "hearing_impaired"),
-            (self.visual_impaired != 0,  "visual_impaired"),
-            (self.original != 0,         "original"),
-            (self.comment != 0,          "comment"),
-            (self.dub != 0,              "dub"),
-        ]
-        .iter()
-        .filter_map(|(set, name)| if *set { Some(*name) } else { None })
-        .collect();
-        if flags.is_empty() { "0".to_string() } else { flags.join("+") }
+    fn to_mkvmerge_flags(&self, tid: usize) -> Vec<String> {
+        let t = tid.to_string();
+        let yn = |v: i32| if v != 0 { "yes" } else { "no" };
+        let mut flags = vec![
+            "--default-track-flag".into(), format!("{t}:{}", yn(self.default)),
+        ];
+        let extras: &[(&str, i32)] = &[
+            ("--forced-display-flag",    self.forced),
+            ("--hearing-impaired-flag",  self.hearing_impaired),
+            ("--visual-impaired-flag",   self.visual_impaired),
+            ("--original-flag",          self.original),
+            ("--commentary-flag",        self.comment),
+        ];
+        for (flag, val) in extras {
+            if *val != 0 {
+                flags.extend([(*flag).to_string(), format!("{t}:yes")]);
+            }
+        }
+        flags
     }
 }
 
@@ -77,16 +81,22 @@ async fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDispos
         .arg(path)
         .output()
         .await
-    else { return vec![] };
+    else {
+        tracing::warn!("ffprobe disposition probe failed for {}", path.display());
+        return vec![];
+    };
     serde_json::from_slice::<FfprobeDispOutput>(&out.stdout)
         .map(|p| p.streams.into_iter().map(|s| s.disposition).collect())
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            tracing::warn!("failed to parse ffprobe disposition output for {}: {e}", path.display());
+            vec![]
+        })
 }
 
 async fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
     let out = Command::new("ffprobe")
         .args([
-            "-v", "quiet",
+            "-v", "error",
             "-select_streams", "a",
             "-show_entries", "stream=codec_name:stream_tags=language",
             "-of", "json",
@@ -175,8 +185,16 @@ pub async fn process(
                 cmd.args([format!("-c:a:{out_idx}"), "copy".into()]);
             }
             AudioMode::Encode => {
-                let codec = codec.unwrap_or("libopus");
-                let bitrate = bitrate.unwrap_or("192k");
+                let codec = codec.ok_or_else(|| anyhow::anyhow!(
+                    "audio track {out_idx}: codec is required when mode = encode"
+                ))?;
+                let bitrate = bitrate.ok_or_else(|| anyhow::anyhow!(
+                    "audio track {out_idx}: bitrate is required when mode = encode"
+                ))?;
+                cmd.args([
+                    format!("-filter:a:{out_idx}"),
+                    "aformat=channel_layouts=7.1|6.1|5.1|5.1(side)|5.0|quad|stereo|mono".into(),
+                ]);
                 cmd.args([format!("-c:a:{out_idx}"), codec.into()]);
                 cmd.args([format!("-b:a:{out_idx}"), bitrate.into()]);
             }
@@ -204,82 +222,56 @@ pub async fn mux_final(
     let has_audio = audio_path.exists()
         && std::fs::metadata(audio_path).map(|m| m.len()).unwrap_or(0) > 0;
 
-    // Probe dispositions before building command:
-    // - video: from source (encoded video has none)
-    // - audio: from audio.mkv (preserved from source even through re-encoding)
-    // - subtitle: ffmpeg copies directly from source via -map, no explicit handling needed
+    // Video dispositions come from source — the encoded file has none.
+    // Audio dispositions are already preserved in audio.mkv by the extraction step.
     let video_disps = probe_dispositions(source_file, "v").await;
-    let audio_disps = if has_audio {
-        probe_dispositions(audio_path, "a").await
-    } else {
-        vec![]
-    };
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
-        .arg("-i")
-        .arg(video_path);
+    let mut cmd = Command::new("mkvmerge");
+    cmd.arg("-o").arg(output_path);
 
+    // Video track: apply dispositions from source, strip everything else
+    if let Some(d) = video_disps.first() {
+        cmd.args(d.to_mkvmerge_flags(0));
+    }
+    cmd.args(["--no-audio", "--no-subtitles", "--no-chapters",
+              "--no-global-tags", "--no-track-tags"]);
+    cmd.arg(video_path);
+
+    // Audio: dispositions already in audio.mkv
     if has_audio {
-        cmd.arg("-i").arg(audio_path);
+        cmd.args(["--no-video", "--no-subtitles", "--no-chapters",
+                  "--no-global-tags", "--no-track-tags"]);
+        cmd.arg(audio_path);
     }
 
-    cmd.arg("-i").arg(source_file);
-
-    // Input index of the source file (used for subtitle/chapter mapping)
-    let src = if has_audio { 2usize } else { 1usize };
-
-    cmd.args(["-map", "0:v:0"]);
-
-    if has_audio {
-        cmd.args(["-map", "1:a?"]);
-    }
-
+    // Source: subtitles + chapters only, no tags
+    cmd.args(["--no-video", "--no-audio", "--no-global-tags", "--no-track-tags"]);
     match subtitle {
-        crate::subtitle::SubtitleSelection::Strip => {}
-        crate::subtitle::SubtitleSelection::All => {
-            cmd.args(["-map", &format!("{src}:s?")]);
+        crate::subtitle::SubtitleSelection::Strip => {
+            cmd.arg("--no-subtitles");
         }
+        crate::subtitle::SubtitleSelection::All => {}
         crate::subtitle::SubtitleSelection::Indices(indices) => {
-            for idx in indices {
-                cmd.args(["-map", &format!("{src}:s:{idx}")]);
+            if indices.is_empty() {
+                cmd.arg("--no-subtitles");
+            } else {
+                let track_ids = crate::subtitle::probe_track_ids(source_file, indices).await?;
+                if track_ids.is_empty() {
+                    cmd.arg("--no-subtitles");
+                } else {
+                    let tracks = track_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+                    cmd.args(["--subtitle-tracks", &tracks]);
+                }
             }
         }
     }
+    cmd.arg(source_file);
 
-    // Always carry over chapters
-    cmd.args(["-map", &format!("{src}:t?")]);
-
-    // Apply dispositions (default, forced, hearing_impaired, …) from source
-    for (i, d) in video_disps.iter().enumerate() {
-        cmd.args([format!("-disposition:v:{i}"), d.to_ffmpeg_flags()]);
-    }
-    for (i, d) in audio_disps.iter().enumerate() {
-        cmd.args([format!("-disposition:a:{i}"), d.to_ffmpeg_flags()]);
-    }
-
-    cmd.args(["-c", "copy"])
-        .args(["-map_metadata:g", "-1"])
-        .arg(output_path);
-
-    let out = cmd.output().await.context("start ffmpeg mux")?;
-    if !out.status.success() {
+    let out = cmd.output().await.context("start mkvmerge")?;
+    // mkvmerge exits 1 for warnings (non-fatal), 2+ for errors
+    if out.status.code().unwrap_or(2) >= 2 {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("ffmpeg mux failed:\n{stderr}");
-    }
-
-    // Strip all MKV tags (global + per-track) — ffmpeg carries them over from source
-    let tag_result = Command::new("mkvpropedit")
-        .args(["--tags", "all:"])
-        .arg(output_path)
-        .output()
-        .await;
-    match tag_result {
-        Ok(o) if !o.status.success() => {
-            tracing::warn!("mkvpropedit tag strip: {}", String::from_utf8_lossy(&o.stderr));
-        }
-        Err(e) => tracing::warn!("mkvpropedit not available: {e}"),
-        _ => {}
+        bail!("mkvmerge failed:\n{stderr}");
     }
 
     Ok(())

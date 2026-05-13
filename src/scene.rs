@@ -48,11 +48,21 @@ fn run_detection(
         .args(["-f", "yuv4mpegpipe", "pipe:1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .context("start ffmpeg for scene detection")?;
 
     let stdout = ffmpeg.stdout.take().expect("ffmpeg stdout unavailable");
+    // Drain stderr on a background thread to prevent the pipe buffer from filling
+    // up and blocking ffmpeg while we are busy consuming stdout.
+    let stderr_handle = {
+        let stderr = ffmpeg.stderr.take().expect("ffmpeg stderr unavailable");
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            BufReader::new(stderr).read_to_string(&mut buf).ok();
+            buf
+        })
+    };
     let reader: Box<dyn Read> = Box::new(BufReader::new(stdout));
 
     let y4m_dec = match y4m::decode(reader).context("init y4m decoder") {
@@ -83,6 +93,10 @@ fn run_detection(
     let results = av_scenechange::detect_scene_changes::<u8>(&mut decoder, opts, None, None);
     let _ = ffmpeg.kill();
     let _ = ffmpeg.wait();
+    let ffmpeg_stderr = stderr_handle.join().unwrap_or_default();
+    if !ffmpeg_stderr.is_empty() {
+        tracing::warn!("ffmpeg scene detection: {}", ffmpeg_stderr.trim());
+    }
     let results = results.context("av-scenechange failed")?;
 
     if results.frame_count == 0 {

@@ -74,8 +74,11 @@ impl DoneFile {
         let mut state = self.state.lock().await;
         state.chunks.insert(chunk_key.to_owned(), ChunkInfo { frames, size_bytes });
         let json = serde_json::to_string_pretty(&*state)?;
-        std::fs::write(&self.path, json)
-            .with_context(|| format!("write done.json: {}", self.path.display()))
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename {} → {}", tmp.display(), self.path.display()))
     }
 }
 

@@ -94,7 +94,20 @@ fn build_encoder_args(config: &Config, output_path: &Path, opts: &EncodeOptions)
 
     let mut args = vec!["-b".to_string(), out.to_string()];
     args.extend(config.encoder_args());
-    args.extend(opts.hdr_args.iter().cloned());
+
+    debug_assert_eq!(opts.hdr_args.len() % 2, 0, "hdr_args must contain flag-value pairs");
+    // Only inject auto-HDR args when the user hasn't set the same param manually.
+    for pair in opts.hdr_args.chunks(2) {
+        if let [flag, value] = pair {
+            let key = flag.trim_start_matches('-');
+            if config.encoder_params.contains_key(key) {
+                tracing::debug!("auto-HDR: skipping {flag} — overridden by encoder_params");
+            } else {
+                args.push(flag.clone());
+                args.push(value.clone());
+            }
+        }
+    }
 
     // Only inject auto-keyint when the user hasn't set it manually in encoder_params
     if let Some(keyint) = opts.keyint {
@@ -130,7 +143,10 @@ pub async fn concat_chunks(
     {
         let mut f = std::fs::File::create(&list_path).context("create concat_list.txt")?;
         for p in chunk_paths {
-            writeln!(f, "file '{}'", p.display()).context("write concat_list.txt")?;
+            let path_str = p.to_str()
+                .with_context(|| format!("non-UTF8 chunk path: {}", p.display()))?;
+            let escaped = path_str.replace('\'', "'\\''");
+            writeln!(f, "file '{escaped}'").context("write concat_list.txt")?;
         }
     }
 
