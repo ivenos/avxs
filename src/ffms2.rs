@@ -147,7 +147,7 @@ struct ErrorInfo {
 
 impl ErrorInfo {
     fn new() -> Self {
-        let mut buf = Box::new([0i8; FFMS_ERROR_BUFFER_SIZE]);
+        let mut buf = Box::new([0; FFMS_ERROR_BUFFER_SIZE]);
         let raw = RawErrorInfo {
             error_type: 0,
             sub_type: 0,
