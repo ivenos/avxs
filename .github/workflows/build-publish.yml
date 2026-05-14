@@ -132,17 +132,3 @@ jobs:
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
-
-  cleanup:
-    runs-on: ubuntu-latest
-    needs: push
-    if: github.event_name != 'pull_request'
-    permissions:
-      packages: write
-    steps:
-      - name: Delete untagged package versions
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: avxs
-          package-type: container
-          delete-only-untagged-versions: true
