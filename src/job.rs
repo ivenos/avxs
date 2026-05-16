@@ -49,13 +49,16 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     .await
     .context("spawn_blocking VideoSource")??;
 
-    let num_workers = workers::calculate(&video_info, stem);
+    let threads_per_worker = config.encoder_params
+        .get("lp")
+        .and_then(|v| match v { toml::Value::Integer(i) => Some(*i as usize), _ => None })
+        .unwrap_or(6);
+    let num_workers = workers::calculate(&video_info, stem, threads_per_worker);
 
     // -----------------------------------------------------------------------
     // FPS (resolved before crop/keyint so duration_secs is valid)
     // -----------------------------------------------------------------------
-    let (fps_num, fps_den) = probe_fps(&job.source_file).await
-        .context("ffprobe could not determine fps")?;
+    let (fps_num, fps_den) = probe_fps(&job.source_file).await?;
     let fps = fps_num as f64 / fps_den as f64;
 
     // -----------------------------------------------------------------------
@@ -201,7 +204,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         let total_f          = total_frames;
 
         set.spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
+            let _permit = sem.acquire().await.context("acquire semaphore")?;
 
             let scene_frames = scene.frame_count();
             let t0           = std::time::Instant::now();
@@ -417,7 +420,7 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-async fn probe_fps(source: &Path) -> Option<(u32, u32)> {
+async fn probe_fps(source: &Path) -> Result<(u32, u32)> {
     #[derive(serde::Deserialize)]
     struct Probe { streams: Vec<Stream> }
     #[derive(serde::Deserialize)]
@@ -430,17 +433,26 @@ async fn probe_fps(source: &Path) -> Option<(u32, u32)> {
         .arg(source)
         .output()
         .await
-        .ok()?;
+        .context("start ffprobe for fps detection")?;
 
-    let p: Probe = serde_json::from_slice(&out.stdout).ok()?;
-    let rate = p.streams.into_iter().next()?.avg_frame_rate;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("ffprobe failed:\n{stderr}");
+    }
+
+    let p: Probe = serde_json::from_slice(&out.stdout)
+        .context("parse ffprobe fps output")?;
+    let rate = p.streams.into_iter().next()
+        .map(|s| s.avg_frame_rate)
+        .context("ffprobe found no video stream")?;
+
     if let Some((n, d)) = rate.split_once('/') {
-        let n: u32 = n.trim().parse().ok()?;
-        let d: u32 = d.trim().parse().ok()?;
-        if d > 0 && n > 0 { Some((n, d)) } else { None }
+        let n: u32 = n.trim().parse().context("parse fps numerator")?;
+        let d: u32 = d.trim().parse().context("parse fps denominator")?;
+        if d > 0 && n > 0 { Ok((n, d)) } else { bail!("invalid fps: {n}/{d}") }
     } else {
-        let n: u32 = rate.trim().parse().ok()?;
-        if n > 0 { Some((n, 1)) } else { None }
+        let n: u32 = rate.trim().parse().context("parse fps")?;
+        if n > 0 { Ok((n, 1)) } else { bail!("invalid fps: {n}") }
     }
 }
 

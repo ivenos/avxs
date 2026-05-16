@@ -1,24 +1,26 @@
 # avxs
 
-avxs is a Docker-first AV1 encoding service written in Rust. Drop videos and an `encode.toml` profile into a folder — avxs picks them up, splits each file into scenes, encodes the chunks in parallel with SVT-AV1, and merges everything into a finished MKV.
+![Docker Image Size](https://img.shields.io/docker/image-size/ivenos/avxs)
+![Docker Pulls](https://img.shields.io/docker/pulls/ivenos/avxs)
+
+avxs is a Docker-first AV1 encoding service written in Rust. Drop videos and an `encode.toml` profile into a folder - avxs picks them up, splits each file into scenes, encodes the chunks in parallel with SVT-AV1, and merges everything into a finished MKV.
 
 ## Features
 
-- **Scene-based encoding** — splits files into scenes via [av-scenechange](https://github.com/rust-av/av-scenechange), encodes all chunks in parallel, and resumes from the last completed chunk if interrupted
-- **HDR passthrough** — auto-detects HDR10 and HLG, passes color metadata to the encoder automatically
-- **Auto-crop** — detects and removes black bars
-- **Auto-scale** — downscales to a target height
-- **Auto-keyint** — derives `--keyint` from source FPS for a ~5 s keyframe interval
-- **Audio control** — copy or re-encode per codec, language whitelist, per-codec rules
-- **Subtitle control** — copy or strip, language whitelist
+- **Scene-based encoding** - splits files into scenes via [av-scenechange](https://github.com/rust-av/av-scenechange), encodes all chunks in parallel, and resumes from the last completed chunk if interrupted
+- **HDR passthrough** - auto-detects HDR10 and HLG, passes color metadata to the encoder automatically
+- **Auto-crop** - detects and removes black bars
+- **Auto-scale** - downscales to a target height
+- **Auto-keyint** - derives `--keyint` from source FPS for a ~5 s keyframe interval
+- **Audio control** - copy or re-encode per codec, language whitelist, per-codec rules
+- **Subtitle control** - copy or strip, language whitelist
 
 ## Quick Start
 
 ```yaml
-# compose.yaml
 services:
   avxs:
-    image: ghcr.io/ivenos/avxs:latest
+    image: ivenos/avxs:latest
     volumes:
       - ./input:/input
       - ./output:/output
@@ -50,4 +52,4 @@ Set `RUST_LOG=debug` for verbose logging.
 
 ## License
 
-[BSL 1.1](LICENSE) — free for personal and non-commercial use.
+[BSL 1.1](LICENSE) - free for personal and non-commercial use.

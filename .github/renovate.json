@@ -1,10 +1,14 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:base"],
+  "extends": ["config:recommended"],
   "packageRules": [
     {
       "matchManagers": ["cargo"],
       "automerge": true
+    },
+    {
+      "enabled": false,
+      "matchPackageNames": ["ghcr.io/ivenos/avxs"]
     }
   ],
   "regexManagers": [
@@ -22,7 +26,7 @@
       "matchStrings": [
         "ARG SVT_AV1_HDR_VERSION=(?<currentValue>[^\\n]+)"
       ],
-      "datasourceTemplate": "github-releases",
+      "datasourceTemplate": "github-tags",
       "depNameTemplate": "juliobbv-p/svt-av1-hdr",
       "versioningTemplate": "semver"
     },

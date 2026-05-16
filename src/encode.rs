@@ -145,8 +145,13 @@ pub async fn concat_chunks(
         for p in chunk_paths {
             let path_str = p.to_str()
                 .with_context(|| format!("non-UTF8 chunk path: {}", p.display()))?;
-            let escaped = path_str.replace('\'', "'\\''");
-            writeln!(f, "file '{escaped}'").context("write concat_list.txt")?;
+            // ffmpeg concat format uses its own parser, not shell semantics.
+            // Backslash-escape special characters in unquoted form.
+            let escaped = path_str
+                .replace('\\', "\\\\")
+                .replace(' ',  "\\ ")
+                .replace('\'', "\\'");
+            writeln!(f, "file {escaped}").context("write concat_list.txt")?;
         }
     }
 

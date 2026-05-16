@@ -124,7 +124,11 @@ fn mode_value(values: &[String]) -> Option<String> {
     for v in values {
         *counts.entry(v.as_str()).or_insert(0) += 1;
     }
-    counts.into_iter().max_by_key(|(_, c)| *c).map(|(v, _)| v.to_string())
+    // Stable tie-break: prefer the lexicographically smaller crop string (larger crop area wins
+    // by count; on equal count, the smaller string is a deterministic fallback).
+    counts.into_iter()
+        .max_by(|(k1, c1), (k2, c2)| c1.cmp(c2).then_with(|| k2.cmp(k1)))
+        .map(|(v, _)| v.to_string())
 }
 
 fn cache_result(path: &Path, content: &str) {

@@ -1,6 +1,6 @@
 services:
   avxs:
-    image: ghcr.io/ivenos/avxs:latest
+    image: ivenos/avxs:latest
     volumes:
       - ./input:/input
       - ./output:/output
