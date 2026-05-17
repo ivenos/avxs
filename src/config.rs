@@ -171,11 +171,10 @@ impl Config {
     }
 
     pub fn encoder_args(&self) -> Vec<String> {
-        let mut keys: Vec<&String> = self.encoder_params.keys().collect();
-        keys.sort();
-        let mut args = Vec::with_capacity(keys.len() * 2);
-        for k in keys {
-            let v = &self.encoder_params[k];
+        let mut entries: Vec<_> = self.encoder_params.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut args = Vec::with_capacity(entries.len() * 2);
+        for (k, v) in entries {
             args.push(format!("--{k}"));
             args.push(match v {
                 toml::Value::String(s)  => s.clone(),

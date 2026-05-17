@@ -9,6 +9,7 @@ pub struct Job {
 }
 
 impl Job {
+    /// Always UTF-8: `find_video_files` filters non-UTF8 names before Jobs are constructed.
     pub fn stem(&self) -> &str {
         self.source_file
             .file_stem()
@@ -38,10 +39,7 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
             continue;
         }
 
-        let mut video_files = find_video_files(profile_dir)?;
-        video_files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-        for source_file in video_files {
+        for source_file in find_video_files(profile_dir)? {
             if output_exists(output_dir, &source_file) {
                 tracing::debug!(file = %source_file.display(), "skip: output exists");
                 continue;
@@ -64,12 +62,18 @@ fn find_video_files(dir: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
-        if let Some(ext) = ext {
-            if EXTENSIONS.contains(&ext.as_str()) {
-                files.push(path);
+        if let Some(ext) = ext
+            && EXTENSIONS.contains(&ext.as_str())
+        {
+            // Skip non-UTF8 stems: they'd collide on the fallback name and break temp-dir layout.
+            if path.file_stem().and_then(|s| s.to_str()).is_none() {
+                tracing::warn!("skipping file with non-UTF8 name: {}", path.display());
+                continue;
             }
+            files.push(path);
         }
     }
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     Ok(files)
 }
 

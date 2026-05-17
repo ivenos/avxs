@@ -11,9 +11,10 @@
       "matchPackageNames": ["ghcr.io/ivenos/avxs"]
     }
   ],
-  "regexManagers": [
+  "customManagers": [
     {
-      "fileMatch": ["Dockerfile"],
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": [
         "ARG SVT_AV1_VERSION=(?<currentValue>[^\\n]+)"
       ],
@@ -22,7 +23,8 @@
       "versioningTemplate": "semver"
     },
     {
-      "fileMatch": ["Dockerfile"],
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": [
         "ARG SVT_AV1_HDR_VERSION=(?<currentValue>[^\\n]+)"
       ],
@@ -31,7 +33,8 @@
       "versioningTemplate": "semver"
     },
     {
-      "fileMatch": ["Dockerfile"],
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": [
         "ARG FFMS2_VERSION=(?<currentValue>[^\\n]+)"
       ],
@@ -40,9 +43,60 @@
       "versioningTemplate": "loose"
     },
     {
-      "fileMatch": ["Dockerfile"],
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": [
         "ARG RUST_VERSION=(?<currentValue>[^\\n]+)"
+      ],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "rust",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
+      "matchStrings": [
+        "SVT_AV1_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
+      ],
+      "datasourceTemplate": "gitlab-releases",
+      "depNameTemplate": "AOMediaCodec/SVT-AV1",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
+      "matchStrings": [
+        "SVT_AV1_HDR_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
+      ],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "juliobbv-p/svt-av1-hdr",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
+      "matchStrings": [
+        "FFMS2_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "FFMS/ffms2",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
+      "matchStrings": [
+        "RUST_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
+      ],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "rust",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Cargo\\.toml$/"],
+      "matchStrings": [
+        "rust-version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
       ],
       "datasourceTemplate": "docker",
       "depNameTemplate": "rust",

@@ -8,6 +8,7 @@ use crate::audio;
 use crate::config::Config;
 use crate::encode::{self, EncodeOptions};
 use crate::ffms2::{self, Crop};
+use crate::paths::external_bin;
 use crate::resume::{DoneFile, SceneEntry, TempDir};
 use crate::scanner::Job;
 use crate::scene;
@@ -29,7 +30,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     temp.create_dirs()?;
 
     if temp.failed_path.exists() {
-        tracing::warn!("[{stem}] permanently failed — delete .avxs_{stem}/.failed to retry");
+        tracing::warn!("[{stem}] permanently failed - delete .avxs_{stem}/.failed to retry");
         return Ok(());
     }
 
@@ -51,19 +52,20 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let threads_per_worker = config.encoder_params
         .get("lp")
-        .and_then(|v| match v { toml::Value::Integer(i) => Some(*i as usize), _ => None })
+        .and_then(|v| match v {
+            toml::Value::Integer(i) => usize::try_from(*i).ok(),
+            toml::Value::String(s)  => s.parse().ok(),
+            _ => None,
+        })
+        .filter(|&n| n > 0)
         .unwrap_or(6);
     let num_workers = workers::calculate(&video_info, stem, threads_per_worker);
 
-    // -----------------------------------------------------------------------
-    // FPS (resolved before crop/keyint so duration_secs is valid)
-    // -----------------------------------------------------------------------
+    // FPS resolved before crop/keyint so duration_secs is valid
     let (fps_num, fps_den) = probe_fps(&job.source_file).await?;
     let fps = fps_num as f64 / fps_den as f64;
 
-    // -----------------------------------------------------------------------
     // Auto-HDR
-    // -----------------------------------------------------------------------
     let hdr_args: Vec<String> = if config.avxs.hdr {
         let hdr = crate::hdr::detect(&job.source_file).await?;
         if hdr.hdr_type == "Dolby Vision" || hdr.hdr_type == "HDR10+" {
@@ -79,9 +81,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         Vec::new()
     };
 
-    // -----------------------------------------------------------------------
     // Auto-Crop
-    // -----------------------------------------------------------------------
     let crop_str: Option<String> = if config.avxs.crop {
         let duration_secs = video_info.num_frames as f64 / fps;
         crate::crop::detect(&job.source_file, duration_secs, &temp.crop_cache, stem).await?
@@ -89,9 +89,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         None
     };
 
-    // -----------------------------------------------------------------------
-    // Auto-Scale + derive FFMS2 target dimensions and scaled crop
-    // -----------------------------------------------------------------------
+    // Auto-Scale: derive FFMS2 target dimensions and remapped crop
     let (ffms2_target, scaled_crop, scene_vf) = compute_output_params(
         video_info.width,
         video_info.height,
@@ -100,9 +98,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         stem,
     );
 
-    // -----------------------------------------------------------------------
-    // Auto-Keyint  (~5 s keyframe distance from source FPS)
-    // -----------------------------------------------------------------------
+    // Auto-Keyint: ~5s keyframe distance from source FPS
     let auto_keyint: Option<u32> = if config.avxs.keyint {
         let ki = (fps * 5.0).round().max(1.0) as u32;
         tracing::info!("[{stem}] auto-keyint: {ki} ({fps:.3} fps → keyframe every ~5s)");
@@ -120,9 +116,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         fps_den,
     });
 
-    // -----------------------------------------------------------------------
     // Scene detection
-    // -----------------------------------------------------------------------
     let scenes: Vec<SceneEntry> = if temp.scenes_path.exists() {
         tracing::info!("[{stem}] reusing scenes.json");
         crate::resume::read_scenes(&temp.scenes_path)?
@@ -143,36 +137,19 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let total_chunks = scenes.len();
     let total_frames: u64 = scenes.iter().map(|s| s.frame_count()).sum();
 
-    {
-        let mut args = config.encoder_args();
-        for pair in encode_opts.hdr_args.chunks(2) {
-            if let [flag, value] = pair {
-                if !config.encoder_params.contains_key(flag.trim_start_matches('-')) {
-                    args.push(flag.clone());
-                    args.push(value.clone());
-                }
-            }
-        }
-        if let Some(ki) = encode_opts.keyint {
-            if !config.encoder_params.contains_key("keyint") {
-                args.extend_from_slice(&["--keyint".into(), ki.to_string()]);
-            }
-        }
-        // Pair up --key value into "key=value" for a compact single-line summary
-        let summary: Vec<String> = args.chunks(2)
-            .filter_map(|pair| match pair {
-                [k, v] => Some(format!("{}={}", k.trim_start_matches('-'), v)),
-                _      => None,
-            })
-            .collect();
-        tracing::info!("[{stem}] encoder args: {}", summary.join(" "));
-    }
+    // Compact "key=value" summary of effective encoder args
+    let summary: Vec<String> = encode::merged_encoder_args(&config, &encode_opts)
+        .chunks(2)
+        .filter_map(|pair| match pair {
+            [k, v] => Some(format!("{}={}", k.trim_start_matches('-'), v)),
+            _      => None,
+        })
+        .collect();
+    tracing::info!("[{stem}] encoder args: {}", summary.join(" "));
 
     tracing::info!("[{stem}] encoding: {total_chunks} chunks, {num_workers} worker(s)");
 
-    // -----------------------------------------------------------------------
     // Parallel chunk encoding
-    // -----------------------------------------------------------------------
     let done               = Arc::new(DoneFile::load_or_create(&temp.done_path)?);
     let semaphore          = Arc::new(Semaphore::new(num_workers));
     let completed_chunks   = Arc::new(AtomicUsize::new(0));
@@ -222,7 +199,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
             let n_frames = completed_frames.fetch_add(scene_frames, Ordering::Relaxed) + scene_frames;
             let pct      = n_frames * 100 / total_f;
             tracing::info!(
-                "[{stem_owned}] chunk {n_chunks}/{total_c} — {pct}% — {enc_fps:.1} fps — {:.1} MB",
+                "[{stem_owned}] chunk {n_chunks}/{total_c} - {pct}% - {enc_fps:.1} fps - {:.1} MB",
                 size_bytes as f64 / 1_048_576.0
             );
 
@@ -270,34 +247,17 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 }
 
 pub fn handle_failure(_job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Error) {
-    tracing::error!("[{stem}] job failed — source kept, temp dir preserved\n{err:#}");
+    tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
 
     let temp = TempDir::for_video(&ctx.output_dir, stem);
     if let Err(e) = std::fs::write(&temp.failed_path, format!("{err:#}")) {
-        tracing::warn!("[{stem}] could not write failure marker: {e}");
+        tracing::warn!("[{stem}] could not write failure marker: {e:#}");
     }
 }
 
-// ---------------------------------------------------------------------------
-// Output parameter calculation
-// ---------------------------------------------------------------------------
-//
-// Returns:
-//   (ffms2_target, scaled_crop, scene_vf_filter)
-//
-// ffms2_target  — dimensions FFMS2 should scale the full frame to (None = native)
-// scaled_crop   — crop region within the FFMS2 output (coordinates already scaled)
-// scene_vf      — ffmpeg -vf string for scene detection (crop and/or scale combined)
-//
-// Logic:
-//   1. Parse source-space crop (from cropdetect output)
-//   2. Determine effective source dimensions after crop
-//   3. If scale target set and effective height > target: calculate scale factor
-//   4. When scaling: FFMS2 scales the full source frame, crop coordinates are
-//      mapped proportionally into the scaled space
-//   5. scene_vf uses ffmpeg crop/scale filters (source-space coordinates, so no
-//      remapping needed there)
-
+/// Returns `(ffms2_target, scaled_crop, scene_vf_filter)`.
+/// FFMS2 scales the full source frame; crop is remapped into the scaled space.
+/// `scene_vf` works in source-space (ffmpeg handles crop+scale in one filter).
 fn compute_output_params(
     src_w: u32,
     src_h: u32,
@@ -329,7 +289,7 @@ fn compute_output_params(
     let scene_vf: Option<String> = build_scene_vf(crop_str, scale_factor, eff_w, eff_h);
 
     if scale_factor == 1.0 {
-        // No scaling — return src_crop unchanged for the FFMS2 pipeline
+        // No scaling - return src_crop unchanged for the FFMS2 pipeline
         return (None, src_crop, scene_vf);
     }
 
@@ -352,8 +312,7 @@ fn compute_output_params(
     (Some((ffms2_w, ffms2_h)), scaled_crop, scene_vf)
 }
 
-/// Build the ffmpeg -vf filter string for scene detection.
-/// Uses source-space crop coordinates — no scaling needed since ffmpeg handles both in one filter.
+/// ffmpeg -vf filter for scene detection (source-space crop + optional scale).
 fn build_scene_vf(crop_str: Option<&str>, scale_factor: f64, eff_w: u32, eff_h: u32) -> Option<String> {
     let has_crop  = crop_str.is_some();
     let has_scale = scale_factor < 1.0;
@@ -378,13 +337,7 @@ fn round_down_even(v: u32) -> u32 {
     v & !1
 }
 
-// ---------------------------------------------------------------------------
-// File stability check
-// ---------------------------------------------------------------------------
-
-/// Waits until the file size is stable (two consecutive checks are equal).
-/// Uses a short 200 ms initial check so already-complete files return immediately.
-/// Falls back to 2 s polling when the file is actively being written. Times out after 300 s.
+/// Waits until file size is stable across two checks. 200ms fast-path, then 2s polling, 300s timeout.
 async fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
     const TIMEOUT_SECS: u64 = 300;
 
@@ -397,7 +350,7 @@ async fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
         return Ok(());
     }
 
-    tracing::info!("[{stem}] file is still being written — waiting...");
+    tracing::info!("[{stem}] file is still being written - waiting...");
     let deadline = tokio::time::Instant::now()
         + tokio::time::Duration::from_secs(TIMEOUT_SECS);
 
@@ -426,7 +379,7 @@ async fn probe_fps(source: &Path) -> Result<(u32, u32)> {
     #[derive(serde::Deserialize)]
     struct Stream { avg_frame_rate: String }
 
-    let out = tokio::process::Command::new("ffprobe")
+    let out = tokio::process::Command::new(external_bin("ffprobe"))
         .args(["-v", "error", "-select_streams", "v:0",
                "-show_entries", "stream=avg_frame_rate",
                "-of", "json"])

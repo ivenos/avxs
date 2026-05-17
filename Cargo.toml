@@ -1,6 +1,6 @@
 [package]
 name = "avxs"
-version = "0.1.0"
+version = "0.0.0"          # placeholder - real version is the git tag (Docker/AppImage releases)
 edition = "2024"
 rust-version = "1.95"
 

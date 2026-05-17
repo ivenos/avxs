@@ -1,0 +1,144 @@
+name: AppImage
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  SVT_AV1_VERSION: v4.1.0
+  SVT_AV1_HDR_VERSION: v4.1.0
+  FFMS2_VERSION: "5.0"
+  RUST_VERSION: 1.95.0
+
+jobs:
+  appimage:
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            enable_avx512: "ON"
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            enable_avx512: "OFF"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake nasm yasm git curl ca-certificates \
+            pkg-config autoconf automake libtool \
+            libavcodec-dev libavformat-dev libswscale-dev libavutil-dev libpostproc-dev \
+            ffmpeg mkvtoolnix \
+            file desktop-file-utils zsync \
+            fuse libfuse2
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: appimage-${{ matrix.arch }}
+
+      - name: Build SVT-AV1
+        run: |
+          git clone --depth 1 --branch "$SVT_AV1_VERSION" \
+            https://gitlab.com/AOMediaCodec/SVT-AV1.git /tmp/svt-av1
+          cmake -B /tmp/svt-av1/build /tmp/svt-av1 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_AVX512=${{ matrix.enable_avx512 }} -DNATIVE=OFF
+          cmake --build /tmp/svt-av1/build --parallel "$(nproc)"
+          sudo cmake --install /tmp/svt-av1/build
+
+      - name: Build SVT-AV1-hdr
+        run: |
+          git clone --depth 1 --branch "$SVT_AV1_HDR_VERSION" \
+            https://github.com/juliobbv-p/svt-av1-hdr.git /tmp/svt-av1-hdr
+          cmake -B /tmp/svt-av1-hdr/build /tmp/svt-av1-hdr \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local/hdr \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_AVX512=${{ matrix.enable_avx512 }} -DNATIVE=OFF
+          cmake --build /tmp/svt-av1-hdr/build --parallel "$(nproc)"
+          sudo cmake --install /tmp/svt-av1-hdr/build
+          sudo cp /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
+
+      - name: Build FFMS2
+        run: |
+          git clone --depth 1 --branch "$FFMS2_VERSION" \
+            https://github.com/FFMS/ffms2.git /tmp/ffms2
+          cd /tmp/ffms2
+          mkdir -p src/config
+          autoreconf -fiv
+          ./configure --prefix=/usr/local --enable-shared=yes --enable-static=no
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+
+      - name: Build avxs
+        env:
+          PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+        run: cargo build --release --locked
+
+      - name: Stage AppDir
+        run: |
+          set -eux
+          APPDIR="$PWD/AppDir"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
+
+          cp target/release/avxs              "$APPDIR/usr/bin/"
+          cp /usr/local/bin/SvtAv1EncApp      "$APPDIR/usr/bin/"
+          cp /usr/local/bin/SvtAv1EncApp-hdr  "$APPDIR/usr/bin/"
+          cp /usr/local/bin/ffmsindex         "$APPDIR/usr/bin/"
+          cp "$(command -v ffmpeg)"           "$APPDIR/usr/bin/"
+          cp "$(command -v ffprobe)"          "$APPDIR/usr/bin/"
+          cp "$(command -v mkvmerge)"         "$APPDIR/usr/bin/"
+
+          cp /usr/local/lib/libffms2.so*      "$APPDIR/usr/lib/"
+
+      - name: Build AppImage
+        run: |
+          set -eux
+          curl -fsSLO "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage"
+          chmod +x "linuxdeploy-${{ matrix.arch }}.AppImage"
+
+          OUTPUT="avxs-${{ matrix.arch }}.AppImage" \
+          "./linuxdeploy-${{ matrix.arch }}.AppImage" \
+            --appdir AppDir \
+            --desktop-file packaging/appimage/avxs.desktop \
+            --icon-file packaging/appimage/avxs.svg \
+            --output appimage
+
+      - name: Smoke test
+        run: |
+          set +e
+          mkdir -p /tmp/smoke && cd /tmp/smoke
+          timeout 10 "$GITHUB_WORKSPACE/avxs-${{ matrix.arch }}.AppImage" 2>&1 | tee smoke.log
+          set -e
+          grep -q "avxs started" smoke.log
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: avxs-${{ matrix.arch }}.AppImage
+          path: avxs-${{ matrix.arch }}.AppImage
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: avxs-${{ matrix.arch }}.AppImage
+          fail_on_unmatched_files: true

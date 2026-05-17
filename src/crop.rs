@@ -2,6 +2,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::paths::external_bin;
+
 /// Detects black bars via ffmpeg cropdetect. Result is cached next to the source file.
 /// Returns the crop string in ffmpeg format: "crop=W:H:X:Y", or None if no crop needed.
 pub async fn detect(
@@ -78,7 +80,7 @@ async fn probe_dimensions(source_file: &Path) -> Result<(u64, u64)> {
     #[derive(serde::Deserialize)]
     struct Stream { width: u64, height: u64 }
 
-    let out = tokio::process::Command::new("ffprobe")
+    let out = tokio::process::Command::new(external_bin("ffprobe"))
         .args(["-v", "error", "-select_streams", "v:0",
                "-show_entries", "stream=width,height", "-of", "json"])
         .arg(source_file)
@@ -91,7 +93,7 @@ async fn probe_dimensions(source_file: &Path) -> Result<(u64, u64)> {
 }
 
 async fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Vec<String> {
-    let out = tokio::process::Command::new("ffmpeg")
+    let out = tokio::process::Command::new(external_bin("ffmpeg"))
         .args(["-ss", &seek_secs.to_string()])
         .arg("-i").arg(source_file)
         // threshold=128 for HDR/10-bit sources; round=16 ensures 16-pixel-aligned results
@@ -133,6 +135,6 @@ fn mode_value(values: &[String]) -> Option<String> {
 
 fn cache_result(path: &Path, content: &str) {
     if let Err(e) = std::fs::write(path, content) {
-        tracing::warn!("could not write crop cache {}: {e}", path.display());
+        tracing::warn!("could not write crop cache {}: {e:#}", path.display());
     }
 }

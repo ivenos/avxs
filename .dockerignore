@@ -1,0 +1,11 @@
+target/
+.git/
+.github/
+test/
+packaging/
+docs.md
+README.md
+LICENSE
+.gitignore
+.dockerignore
+*.md

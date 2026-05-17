@@ -4,6 +4,7 @@ use std::path::Path;
 use tokio::process::Command;
 
 use crate::config::{SubtitleConfig, SubtitleMode};
+use crate::paths::external_bin;
 
 pub enum SubtitleSelection {
     Strip,
@@ -19,7 +20,7 @@ pub async fn select_tracks(source: &Path, config: &SubtitleConfig) -> Result<Sub
         return Ok(SubtitleSelection::All);
     }
 
-    let out = Command::new("ffprobe")
+    let out = Command::new(external_bin("ffprobe"))
         .args([
             "-v", "quiet",
             "-select_streams", "s",
@@ -58,7 +59,7 @@ pub async fn select_tracks(source: &Path, config: &SubtitleConfig) -> Result<Sub
 }
 
 pub(crate) async fn probe_track_ids(source: &Path, subtitle_indices: &[usize]) -> Result<Vec<u64>> {
-    let out = Command::new("mkvmerge")
+    let out = Command::new(external_bin("mkvmerge"))
         .args(["--identify", "--identification-format", "json"])
         .arg(source)
         .output()
@@ -84,6 +85,12 @@ pub(crate) async fn probe_track_ids(source: &Path, subtitle_indices: &[usize]) -
         .collect();
 
     Ok(subtitle_indices.iter()
-        .filter_map(|&i| subtitle_ids.get(i).copied())
+        .filter_map(|&i| match subtitle_ids.get(i) {
+            Some(&id) => Some(id),
+            None => {
+                tracing::warn!("subtitle index {i} out of range ({} tracks) - skipped", subtitle_ids.len());
+                None
+            }
+        })
         .collect())
 }

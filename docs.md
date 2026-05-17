@@ -40,7 +40,7 @@ avxs pipeline controls. All flags default to `false` / disabled.
 | `hdr` | Boolean | `false` | Detect HDR type and pass color metadata (`--color-primaries`, `--transfer-characteristics`, `--matrix-coefficients`, `--chroma-sample-position`, `--content-light`, `--mastering-display`) to the encoder automatically. Works for HDR10, HLG, and Dolby Vision/HDR10+ (fallback to HDR10 metadata). Independent of the encoder binary chosen. |
 | `crop` | Boolean | `false` | Detect black bars via `ffmpeg cropdetect` (5 samples at 10/25/40/55/70 % of the runtime, threshold 128 for HDR/10-bit). The detected crop is applied in the Y4M pipe **before** the encoder. Result is cached in `crop.cache` inside the temp directory. |
 | `keyint` | Boolean | `false` | Calculate `--keyint` from source FPS for a ~5 s keyframe distance (`round(fps × 5)`). Silently skipped if `keyint` is already set in `[encoder_params]`. |
-| `scale` | Integer | — | Maximum output height in pixels. The source is scaled down proportionally using Lanczos resampling if taller than this value. If the source (after crop) is already at or below this height, no scaling is applied. Example: `1080` encodes 4K content as 1080p while leaving 720p content untouched. Aspect ratio is always preserved. |
+| `scale` | Integer | - | Maximum output height in pixels. The source is scaled down proportionally using Lanczos resampling if taller than this value. If the source (after crop) is already at or below this height, no scaling is applied. Example: `1080` encodes 4K content as 1080p while leaving 720p content untouched. Aspect ratio is always preserved. |
 | `keep_temp` | Boolean | `false` | Keep temporary chunks and index files after encoding. |
 
 ```toml
@@ -61,8 +61,8 @@ Controls how audio tracks are carried over from the source file.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `mode` | `"copy"` \| `"encode"` | `"copy"` | Global default for all audio tracks |
-| `codec` | String | — | FFmpeg codec name, e.g. `"libopus"` — required when `mode = "encode"` |
-| `bitrate` | String | — | Target bitrate, e.g. `"192k"` — required when `mode = "encode"` |
+| `codec` | String | - | FFmpeg codec name, e.g. `"libopus"` - required when `mode = "encode"` |
+| `bitrate` | String | - | Target bitrate, e.g. `"192k"` - required when `mode = "encode"` |
 | `language_whitelist` | String array | `[]` | Keep only tracks with these language tags (ISO 639-2). Empty = keep all |
 
 ### Language whitelist
@@ -99,8 +99,8 @@ When a matching rule exists for a track's codec, it takes precedence over the gl
 | Key in rule | Type | Description |
 |---|---|---|
 | `mode` | `"copy"` \| `"encode"` | Required |
-| `codec` | String | FFmpeg codec name — required when `mode = "encode"` |
-| `bitrate` | String | Target bitrate — required when `mode = "encode"` |
+| `codec` | String | FFmpeg codec name - required when `mode = "encode"` |
+| `bitrate` | String | Target bitrate - required when `mode = "encode"` |
 
 ```toml
 [audio]
@@ -159,7 +159,7 @@ Chapters are always preserved regardless of the subtitle mode.
 | `extra_split_sec` | Integer | `10` | Maximum chunk length in seconds. Chunks longer than this are split into roughly equal parts. Set to `0` to disable. Ignored when `extra_split` > 0. |
 | `extra_split` | Integer | `0` | Maximum chunk length in frames. Overrides `extra_split_sec` when > 0. Set to `0` to use `extra_split_sec` instead. |
 | `speed` | `"standard"` \| `"fast"` | `"standard"` | Detection algorithm. `standard` uses SATD-based motion estimation for accurate results. `fast` uses raw pixel differences and is 2–3× faster but less accurate, recommended for high resolutions. |
-| `downscale_height` | Integer | — | Downscale to this height (e.g. `720`) for scene detection only. Does not affect encoding output. Reduces detection time for high-resolution sources at the cost of some accuracy. |
+| `downscale_height` | Integer | - | Downscale to this height (e.g. `720`) for scene detection only. Does not affect encoding output. Reduces detection time for high-resolution sources at the cost of some accuracy. |
 
 ```toml
 [scene_detection]

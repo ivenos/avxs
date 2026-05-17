@@ -26,7 +26,7 @@ jobs:
         run: sudo apt-get install -y libffms2-dev nasm
 
       - name: Run unit tests
-        run: cargo test
+        run: cargo test --locked
 
   build:
     needs: test

@@ -13,6 +13,7 @@ ARG FFMS2_VERSION
 ARG RUST_VERSION
 ARG TARGETARCH
 
+# nasm/yasm are x86-only assemblers; SVT-AV1 uses NEON on arm64 instead
 RUN apk add --no-cache \
         build-base \
         cmake \
@@ -24,9 +25,8 @@ RUN apk add --no-cache \
         libtool \
         ffmpeg-dev \
         zlib-dev \
-        ca-certificates
-# nasm/yasm are x86-only assemblers; SVT-AV1 uses NEON on arm64 instead
-RUN [ "$TARGETARCH" != "amd64" ] || apk add --no-cache nasm yasm
+        ca-certificates && \
+    [ "$TARGETARCH" != "amd64" ] || apk add --no-cache nasm yasm
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
@@ -92,7 +92,7 @@ COPY --from=builder /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1EncApp
 COPY --from=builder /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
 COPY --from=builder /usr/local/bin/ffmsindex         /usr/local/bin/ffmsindex
 COPY --from=builder /avxs                             /usr/local/bin/avxs
-# libffms2.so is not in Alpine's package manager — copy from builder
+# libffms2.so is not in Alpine's package manager - copy from builder
 COPY --from=builder /usr/local/lib/libffms2.so*      /usr/local/lib/
 # Add /usr/local/lib to musl dynamic linker search path (filename is arch-specific)
 RUN printf '/lib\n/usr/lib\n/usr/local/lib\n' > /etc/ld-musl-$(uname -m).path

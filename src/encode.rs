@@ -5,21 +5,20 @@ use std::process::Stdio;
 
 use crate::config::{Config, Encoder};
 use crate::ffms2::{Crop, VideoSource};
+use crate::paths::external_bin;
 use crate::resume::SceneEntry;
 
 #[derive(Clone)]
 pub struct EncodeOptions {
-    /// SVT-AV1 HDR args (--color-primaries, --transfer-characteristics, etc.)
+    /// SVT-AV1 HDR args (color-primaries, transfer, etc.)
     pub hdr_args: Vec<String>,
-    /// Auto-calculated keyint; skipped if "keyint" already present in encoder_params.
+    /// Auto-keyint; skipped if user set "keyint" in encoder_params.
     pub keyint: Option<u32>,
-    /// When set, FFMS2 scales the full frame to these dimensions (Lanczos).
-    /// Coordinates in `crop` are already in this scaled space.
+    /// FFMS2 Lanczos target; `crop` coordinates are in this scaled space.
     pub ffms2_target: Option<(u32, u32)>,
-    /// Crop applied in the Y4M pipe after FFMS2 scaling, before the encoder sees the frame.
+    /// Crop applied in the Y4M pipe after scaling.
     pub crop: Option<Crop>,
-    /// FPS rational from ffprobe — overrides whatever FFMS2 reports in the Y4M header.
-    /// FFMS2 returns 0/0 for exotic containers (e.g. Dolby Vision), which breaks IVF timestamps.
+    /// FPS from ffprobe; FFMS2 reports 0/0 for some exotic containers (e.g. DV) which breaks IVF timestamps.
     pub fps_num: u32,
     pub fps_den: u32,
 }
@@ -32,17 +31,18 @@ pub fn encode_chunk(
     config: &Config,
     opts: &EncodeOptions,
 ) -> Result<u64> {
-    let encoder_bin = encoder_binary(config.encoder);
+    let encoder_name = encoder_binary(config.encoder);
+    let encoder_bin = external_bin(encoder_name);
     let encoder_args = build_encoder_args(config, &output_path, opts)?;
 
-    let mut child = std::process::Command::new(encoder_bin)
+    let mut child = std::process::Command::new(&encoder_bin)
         .args(&encoder_args)
         .args(["--input", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("start encoder '{encoder_bin}'"))?;
+        .with_context(|| format!("start encoder '{encoder_name}'"))?;
 
     let mut stdin = BufWriter::with_capacity(256 * 1024, child.stdin.take().expect("encoder stdin unavailable"));
 
@@ -51,8 +51,7 @@ pub fn encode_chunk(
         None         => VideoSource::open(&source_file, &index_file),
     }
     .context("open FFMS2 VideoSource")?;
-    // Always use the ffprobe fps — FFMS2 reports 0/0 for exotic containers (e.g. Dolby Vision),
-    // which would write F0:0 in the Y4M header and corrupt IVF timestamps.
+    // Override FFMS2 fps with ffprobe value (FFMS2 returns 0/0 for some containers, corrupting IVF timestamps).
     vs.info.fps_num = opts.fps_num;
     vs.info.fps_den = opts.fps_den;
     if let Err(e) =
@@ -93,15 +92,21 @@ fn build_encoder_args(config: &Config, output_path: &Path, opts: &EncodeOptions)
         .with_context(|| format!("non-UTF8 output path: {}", output_path.display()))?;
 
     let mut args = vec!["-b".to_string(), out.to_string()];
-    args.extend(config.encoder_args());
+    args.extend(merged_encoder_args(config, opts));
+    Ok(args)
+}
+
+/// Encoder args from config, merged with auto-HDR and auto-keyint.
+/// Auto-args are skipped when the same key is already in `encoder_params` (user override wins).
+pub fn merged_encoder_args(config: &Config, opts: &EncodeOptions) -> Vec<String> {
+    let mut args = config.encoder_args();
 
     debug_assert_eq!(opts.hdr_args.len() % 2, 0, "hdr_args must contain flag-value pairs");
-    // Only inject auto-HDR args when the user hasn't set the same param manually.
     for pair in opts.hdr_args.chunks(2) {
         if let [flag, value] = pair {
             let key = flag.trim_start_matches('-');
             if config.encoder_params.contains_key(key) {
-                tracing::debug!("auto-HDR: skipping {flag} — overridden by encoder_params");
+                tracing::debug!("auto-HDR: skipping {flag} - overridden by encoder_params");
             } else {
                 args.push(flag.clone());
                 args.push(value.clone());
@@ -109,18 +114,17 @@ fn build_encoder_args(config: &Config, output_path: &Path, opts: &EncodeOptions)
         }
     }
 
-    // Only inject auto-keyint when the user hasn't set it manually in encoder_params
-    if let Some(keyint) = opts.keyint {
-        if !config.encoder_params.contains_key("keyint") {
-            args.extend_from_slice(&["--keyint".into(), keyint.to_string()]);
-        }
+    if let Some(keyint) = opts.keyint
+        && !config.encoder_params.contains_key("keyint")
+    {
+        args.extend_from_slice(&["--keyint".into(), keyint.to_string()]);
     }
 
-    Ok(args)
+    args
 }
 
 pub async fn validate_output(path: &Path) -> Result<()> {
-    let out = tokio::process::Command::new("ffprobe")
+    let out = tokio::process::Command::new(external_bin("ffprobe"))
         .args(["-v", "error", "-i"])
         .arg(path)
         .output()
@@ -145,8 +149,7 @@ pub async fn concat_chunks(
         for p in chunk_paths {
             let path_str = p.to_str()
                 .with_context(|| format!("non-UTF8 chunk path: {}", p.display()))?;
-            // ffmpeg concat format uses its own parser, not shell semantics.
-            // Backslash-escape special characters in unquoted form.
+            // ffmpeg concat parser: backslash-escape special chars (not shell semantics).
             let escaped = path_str
                 .replace('\\', "\\\\")
                 .replace(' ',  "\\ ")
@@ -155,7 +158,7 @@ pub async fn concat_chunks(
         }
     }
 
-    let out = tokio::process::Command::new("ffmpeg")
+    let out = tokio::process::Command::new(external_bin("ffmpeg"))
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(["-f", "concat", "-safe", "0", "-i"])
         .arg(&list_path)
@@ -277,5 +280,44 @@ mod tests {
 
         let keyint_pos = args.iter().position(|a| a == "--keyint").unwrap();
         assert_eq!(args[keyint_pos + 1], "120");
+    }
+
+    #[test]
+    fn auto_hdr_skipped_when_manual_override() {
+        use crate::config::{AudioConfig, AvxsConfig, SceneDetectionConfig};
+        use std::collections::HashMap;
+
+        let mut params = HashMap::new();
+        // User pinned color-primaries; auto-HDR must not override.
+        params.insert("color-primaries".to_string(), toml::Value::Integer(1));
+
+        let config = Config {
+            encoder: Encoder::SvtAv1,
+            encoder_params: params,
+            avxs: AvxsConfig::default(),
+            audio: AudioConfig::default(),
+            subtitles: crate::config::SubtitleConfig::default(),
+            scene_detection: SceneDetectionConfig::default(),
+        };
+
+        let opts = EncodeOptions {
+            hdr_args: vec![
+                "--color-primaries".into(), "9".into(),
+                "--transfer-characteristics".into(), "16".into(),
+            ],
+            keyint: None,
+            ffms2_target: None,
+            crop: None,
+            fps_num: 24,
+            fps_den: 1,
+        };
+
+        let args = merged_encoder_args(&config, &opts);
+        // User's value 1 wins for color-primaries.
+        let pos = args.iter().position(|a| a == "--color-primaries").unwrap();
+        assert_eq!(args[pos + 1], "1");
+        assert_eq!(args.iter().filter(|a| *a == "--color-primaries").count(), 1);
+        // Non-overridden auto-HDR arg still injected.
+        assert!(args.windows(2).any(|w| w[0] == "--transfer-characteristics" && w[1] == "16"));
     }
 }

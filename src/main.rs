@@ -5,6 +5,7 @@ mod encode;
 mod ffms2;
 mod hdr;
 mod job;
+mod paths;
 mod resume;
 mod scanner;
 mod scene;
@@ -20,9 +21,9 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     init_logging();
 
-    let input_dir = env_path("AVXS_INPUT_DIR", "/input");
-    let output_dir = env_path("AVXS_OUTPUT_DIR", "/output");
-    let poll_interval = env_u64("AVXS_POLL_INTERVAL", 60);
+    let input_dir = env_path("AVXS_INPUT_DIR", "./input");
+    let output_dir = env_path("AVXS_OUTPUT_DIR", "./output");
+    let poll_interval = env_u64("AVXS_POLL_INTERVAL", 60).max(1);
 
     tracing::info!(
         input = %input_dir.display(),
@@ -39,10 +40,16 @@ async fn main() -> Result<()> {
     };
 
     loop {
-        match scanner::scan(&input_dir, &output_dir) {
+        let in_dir  = input_dir.clone();
+        let out_dir = output_dir.clone();
+        let scan_result = tokio::task::spawn_blocking(move || scanner::scan(&in_dir, &out_dir))
+            .await
+            .context("spawn_blocking scanner")?;
+
+        match scan_result {
             Err(e) => tracing::error!("scanner error: {e:#}"),
             Ok(jobs) if jobs.is_empty() => {
-                tracing::debug!("no jobs — sleeping {poll_interval}s");
+                tracing::debug!("no jobs - sleeping {poll_interval}s");
             }
             Ok(jobs) => {
                 tracing::info!("{} job(s) queued", jobs.len());
@@ -82,7 +89,7 @@ fn env_u64(var: &str, default: u64) -> u64 {
         Ok(v) => match v.parse() {
             Ok(n) => n,
             Err(_) => {
-                tracing::warn!("{var} has invalid value {v:?} — using default {default}");
+                tracing::warn!("{var} has invalid value {v:?} - using default {default}");
                 default
             }
         },

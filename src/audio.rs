@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::config::{AudioConfig, AudioMode};
+use crate::paths::external_bin;
 
 #[derive(Deserialize)]
 struct FfprobeOutput {
@@ -74,7 +75,7 @@ struct FfprobeDispOutput {
 }
 
 async fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDisposition> {
-    let Ok(out) = Command::new("ffprobe")
+    let Ok(out) = Command::new(external_bin("ffprobe"))
         .args(["-v", "error", "-select_streams", stream_spec,
                "-show_entries", "stream=disposition",
                "-of", "json"])
@@ -82,19 +83,24 @@ async fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDispos
         .output()
         .await
     else {
-        tracing::warn!("ffprobe disposition probe failed for {}", path.display());
+        tracing::warn!("ffprobe disposition probe failed to start for {}", path.display());
         return vec![];
     };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        tracing::warn!("ffprobe disposition probe failed for {}: {}", path.display(), stderr.trim());
+        return vec![];
+    }
     serde_json::from_slice::<FfprobeDispOutput>(&out.stdout)
         .map(|p| p.streams.into_iter().map(|s| s.disposition).collect())
         .unwrap_or_else(|e| {
-            tracing::warn!("failed to parse ffprobe disposition output for {}: {e}", path.display());
+            tracing::warn!("failed to parse ffprobe disposition output for {}: {e:#}", path.display());
             vec![]
         })
 }
 
 async fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(external_bin("ffprobe"))
         .args([
             "-v", "error",
             "-select_streams", "a",
@@ -157,13 +163,13 @@ pub async fn process(
 
     if kept.is_empty() {
         tracing::warn!(
-            "no audio tracks match language whitelist {:?} — audio omitted",
+            "no audio tracks match language whitelist {:?} - audio omitted",
             config.language_whitelist
         );
         return Ok(audio_path);
     }
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(external_bin("ffmpeg"));
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
         .arg("-i")
         .arg(source_file)
@@ -222,11 +228,10 @@ pub async fn mux_final(
     let has_audio = audio_path.exists()
         && std::fs::metadata(audio_path).map(|m| m.len()).unwrap_or(0) > 0;
 
-    // Video dispositions come from source — the encoded file has none.
-    // Audio dispositions are already preserved in audio.mkv by the extraction step.
+    // Video dispositions come from source (encoded file has none); audio dispositions are already in audio.mkv.
     let video_disps = probe_dispositions(source_file, "v").await;
 
-    let mut cmd = Command::new("mkvmerge");
+    let mut cmd = Command::new(external_bin("mkvmerge"));
     cmd.arg("-o").arg(output_path);
 
     // Video track: apply dispositions from source, strip everything else

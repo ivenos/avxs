@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use crate::config::{SceneDetectionConfig, SceneDetectionSpeedConfig};
+use crate::paths::external_bin;
 use crate::resume::SceneEntry;
 
 pub async fn detect(
@@ -34,7 +35,7 @@ fn run_detection(
 ) -> Result<Vec<SceneEntry>> {
     let actual_vf = build_detection_vf(vf_filter, cfg.downscale_height);
 
-    let mut cmd = std::process::Command::new("ffmpeg");
+    let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
     cmd.args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(source_file);
@@ -53,8 +54,7 @@ fn run_detection(
         .context("start ffmpeg for scene detection")?;
 
     let stdout = ffmpeg.stdout.take().expect("ffmpeg stdout unavailable");
-    // Drain stderr on a background thread to prevent the pipe buffer from filling
-    // up and blocking ffmpeg while we are busy consuming stdout.
+    // Drain stderr on a background thread so its pipe buffer can't block ffmpeg.
     let stderr_handle = {
         let stderr = ffmpeg.stderr.take().expect("ffmpeg stderr unavailable");
         std::thread::spawn(move || {
@@ -261,7 +261,7 @@ mod tests {
         let result = apply_extra_split(scenes, 240);
         assert_eq!(result.len(), 3);
         assert_eq!(result[2].end_frame, 719);
-        for e in &result { assert!(e.end_frame - e.start_frame + 1 <= 240); }
+        for e in &result { assert!(e.frame_count() <= 240); }
     }
 
     #[test]

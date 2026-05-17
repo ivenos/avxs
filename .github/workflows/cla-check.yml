@@ -1,0 +1,19 @@
+name: CLA check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify CLA checkbox is ticked
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! grep -qiE '\[x\].*I agree to the CLA' <<< "$PR_BODY"; then
+            echo "::error::CLA checkbox is not ticked. Please edit the PR description and check the box under 'Contributor License Agreement'."
+            exit 1
+          fi
+          echo "CLA confirmed."

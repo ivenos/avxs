@@ -3,7 +3,7 @@
 ![Docker Image Size](https://img.shields.io/docker/image-size/ivenos/avxs)
 ![Docker Pulls](https://img.shields.io/docker/pulls/ivenos/avxs)
 
-avxs is a Docker-first AV1 encoding service written in Rust. Drop videos and an `encode.toml` profile into a folder - avxs picks them up, splits each file into scenes, encodes the chunks in parallel with SVT-AV1, and merges everything into a finished MKV.
+avxs is an AV1 encoding service written in Rust, distributed as a Docker image and a self-contained Linux AppImage. Drop videos and an `encode.toml` profile into a folder - avxs picks them up, splits each file into scenes, encodes the chunks in parallel with SVT-AV1, and merges everything into a finished MKV.
 
 ## Features
 
@@ -17,6 +17,8 @@ avxs is a Docker-first AV1 encoding service written in Rust. Drop videos and an 
 
 ## Quick Start
 
+### Docker
+
 ```yaml
 services:
   avxs:
@@ -29,19 +31,37 @@ services:
     restart: unless-stopped
 ```
 
+### AppImage (Linux, x86_64 and aarch64)
+
+Grab the latest AppImage for your architecture from the [releases page](https://github.com/ivenos/avxs/releases/latest), or run:
+
+```sh
+ARCH=$(uname -m)
+wget "https://github.com/ivenos/avxs/releases/latest/download/avxs-${ARCH}.AppImage"
+chmod +x "avxs-${ARCH}.AppImage"
+"./avxs-${ARCH}.AppImage"
+```
+
+avxs creates `./input/` and `./output/` next to its working directory and watches them. All required tools (ffmpeg, mkvmerge, SvtAv1EncApp, ffmsindex, libffms2) are bundled inside the AppImage - nothing else to install.
+
+---
+
 Place an `encode.toml` next to your video files and configure your encoding profile. See [docs.md](docs.md) for the full reference.
 
-Encoded files land flat in `/output/`. Source files are moved to `/input/processed/` after a successful encode.
+Encoded files land flat in the output directory. Source files are moved to `input/processed/` after a successful encode.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `AVXS_INPUT_DIR` | `/input` | Input directory |
-| `AVXS_OUTPUT_DIR` | `/output` | Output directory |
+| `AVXS_INPUT_DIR` | `./input` | Input directory |
+| `AVXS_OUTPUT_DIR` | `./output` | Output directory |
 | `AVXS_POLL_INTERVAL` | `60` | Directory scan interval in seconds |
+| `RUST_LOG` | `info` | Log verbosity. Set to `debug` for verbose output |
 
-Set `RUST_LOG=debug` for verbose logging.
+The official Docker image presets `AVXS_INPUT_DIR=/input` and `AVXS_OUTPUT_DIR=/output`, which is why the Compose example above mounts to those paths.
+
+For AppImage, prefix the command: `RUST_LOG=debug ./avxs-x86_64.AppImage`.
 
 ## Supported Encoders
 

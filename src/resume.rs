@@ -64,10 +64,12 @@ impl DoneFile {
     }
 
     pub async fn is_done(&self, chunk_key: &str, chunk_path: &Path) -> bool {
-        if !self.state.lock().await.chunks.contains_key(chunk_key) {
-            return false;
-        }
-        matches!(std::fs::metadata(chunk_path), Ok(m) if m.len() > 0)
+        let expected = match self.state.lock().await.chunks.get(chunk_key) {
+            Some(info) => info.size_bytes,
+            None       => return false,
+        };
+        // Recorded size must match on-disk size; truncated/missing files are not "done".
+        matches!(std::fs::metadata(chunk_path), Ok(m) if m.len() == expected && expected > 0)
     }
 
     pub async fn mark_done(&self, chunk_key: &str, frames: u64, size_bytes: u64) -> Result<()> {

@@ -7,6 +7,8 @@ use std::os::raw::{c_char, c_double, c_int, c_uint};
 use std::path::Path;
 use std::sync::Once;
 
+use crate::paths::external_bin;
+
 const FFMS_ERROR_BUFFER_SIZE: usize = 1024;
 const FFMS_SEEK_NORMAL: c_int = 1; // FFMS2 5.0: enum shifted, 1 = SEEK_NORMAL (supports random access)
 const FFMS_TYPE_VIDEO: c_int = 0;
@@ -183,11 +185,11 @@ pub struct Crop {
 }
 
 impl Crop {
-    /// Parse from "crop=W:H:X:Y" or "W:H:X:Y".
+    /// Parse from "crop=W:H:X:Y" or "W:H:X:Y". Requires exactly 4 parts.
     pub fn from_str(s: &str) -> Option<Self> {
         let s = s.trim_start_matches("crop=");
         let p: Vec<&str> = s.split(':').collect();
-        if p.len() < 4 {
+        if p.len() != 4 {
             return None;
         }
         Some(Crop {
@@ -225,7 +227,12 @@ impl PixelFormat {
             (PixelSubsampling::Yuv444, 8) => "444".into(),
             (PixelSubsampling::Yuv444, 10) => "444p10".into(),
             (PixelSubsampling::Yuv444, 12) => "444p12".into(),
-            _ => "420".into(),
+            (sub, depth) => {
+                tracing::warn!(
+                    "unsupported Y4M format ({sub:?}, {depth}-bit) - falling back to 420 8-bit"
+                );
+                "420".into()
+            }
         }
     }
 
@@ -235,41 +242,32 @@ impl PixelFormat {
 }
 
 fn detect_pixel_format(pix_fmt: c_int) -> PixelFormat {
-    let yuv420p = get_pixel_format("yuv420p");
-    let yuvj420p = get_pixel_format("yuvj420p");
-    let yuv420p10le = get_pixel_format("yuv420p10le");
-    let yuv420p12le = get_pixel_format("yuv420p12le");
-    let yuv420p16le = get_pixel_format("yuv420p16le");
-    let yuv422p = get_pixel_format("yuv422p");
-    let yuv422p10le = get_pixel_format("yuv422p10le");
-    let yuv422p12le = get_pixel_format("yuv422p12le");
-    let yuv444p = get_pixel_format("yuv444p");
-    let yuv444p10le = get_pixel_format("yuv444p10le");
-    let yuv444p12le = get_pixel_format("yuv444p12le");
+    use PixelSubsampling::*;
+    const TABLE: &[(&str, u32, PixelSubsampling)] = &[
+        ("yuv420p",      8, Yuv420),
+        ("yuvj420p",     8, Yuv420),
+        ("yuv420p10le", 10, Yuv420),
+        ("yuv420p12le", 12, Yuv420),
+        ("yuv420p16le", 16, Yuv420),
+        ("yuv422p",      8, Yuv422),
+        ("yuv422p10le", 10, Yuv422),
+        ("yuv422p12le", 12, Yuv422),
+        ("yuv444p",      8, Yuv444),
+        ("yuv444p10le", 10, Yuv444),
+        ("yuv444p12le", 12, Yuv444),
+    ];
 
-    if pix_fmt == yuv420p || pix_fmt == yuvj420p {
-        PixelFormat { pix_fmt, bit_depth: 8, subsampling: PixelSubsampling::Yuv420 }
-    } else if pix_fmt == yuv420p10le {
-        PixelFormat { pix_fmt, bit_depth: 10, subsampling: PixelSubsampling::Yuv420 }
-    } else if pix_fmt == yuv420p12le {
-        PixelFormat { pix_fmt, bit_depth: 12, subsampling: PixelSubsampling::Yuv420 }
-    } else if pix_fmt == yuv420p16le {
-        PixelFormat { pix_fmt, bit_depth: 16, subsampling: PixelSubsampling::Yuv420 }
-    } else if pix_fmt == yuv422p {
-        PixelFormat { pix_fmt, bit_depth: 8, subsampling: PixelSubsampling::Yuv422 }
-    } else if pix_fmt == yuv422p10le {
-        PixelFormat { pix_fmt, bit_depth: 10, subsampling: PixelSubsampling::Yuv422 }
-    } else if pix_fmt == yuv422p12le {
-        PixelFormat { pix_fmt, bit_depth: 12, subsampling: PixelSubsampling::Yuv422 }
-    } else if pix_fmt == yuv444p {
-        PixelFormat { pix_fmt, bit_depth: 8, subsampling: PixelSubsampling::Yuv444 }
-    } else if pix_fmt == yuv444p10le {
-        PixelFormat { pix_fmt, bit_depth: 10, subsampling: PixelSubsampling::Yuv444 }
-    } else if pix_fmt == yuv444p12le {
-        PixelFormat { pix_fmt, bit_depth: 12, subsampling: PixelSubsampling::Yuv444 }
-    } else {
-        // fallback: treat as 8-bit YUV420
-        PixelFormat { pix_fmt: yuv420p, bit_depth: 8, subsampling: PixelSubsampling::Yuv420 }
+    for &(name, bit_depth, subsampling) in TABLE {
+        if pix_fmt == get_pixel_format(name) {
+            return PixelFormat { pix_fmt, bit_depth, subsampling };
+        }
+    }
+
+    tracing::warn!("unrecognized FFMS pixel format {pix_fmt} - falling back to yuv420p 8-bit");
+    PixelFormat {
+        pix_fmt: get_pixel_format("yuv420p"),
+        bit_depth: 8,
+        subsampling: PixelSubsampling::Yuv420,
     }
 }
 
@@ -327,8 +325,7 @@ pub struct VideoSource {
     pub info: VideoInfo,
 }
 
-// FFMS2 is not thread-safe; each worker owns its own VideoSource.
-// spawn_blocking ensures each call runs on a dedicated OS thread.
+// FFMS2 is not thread-safe; each worker owns its own VideoSource on a spawn_blocking thread.
 unsafe impl Send for VideoSource {}
 
 impl Drop for VideoSource {
@@ -516,7 +513,7 @@ impl VideoSource {
 }
 
 pub async fn run_ffmsindex(source_file: &Path, index_file: &Path) -> Result<()> {
-    let out = tokio::process::Command::new("ffmsindex")
+    let out = tokio::process::Command::new(external_bin("ffmsindex"))
         .arg("-f")
         .arg(source_file)
         .arg(index_file)
