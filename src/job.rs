@@ -29,11 +29,6 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let temp = TempDir::for_video(&ctx.output_dir, stem);
     temp.create_dirs()?;
 
-    if temp.failed_path.exists() {
-        tracing::warn!("[{stem}] permanently failed - delete .avxs_{stem}/.failed to retry");
-        return Ok(());
-    }
-
     if !temp.index_path.exists() {
         tracing::info!("[{stem}] indexing");
         ffms2::run_ffmsindex(&job.source_file, &temp.index_path).await?;
@@ -133,6 +128,29 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         tracing::info!("[{stem}] {} chunks", scenes.len());
         scenes
     };
+
+    // clamp to FFMS2 frame count - scene detector may overcount on broken remuxes
+    let ffms2_frames = video_info.num_frames as u64;
+    let scenes: Vec<SceneEntry> = scenes
+        .into_iter()
+        .filter_map(|mut s| {
+            if s.start_frame >= ffms2_frames {
+                tracing::warn!(
+                    "[{stem}] dropping scene {} (start {} >= FFMS2 frame count {})",
+                    s.index, s.start_frame, ffms2_frames
+                );
+                return None;
+            }
+            if s.end_frame >= ffms2_frames {
+                tracing::warn!(
+                    "[{stem}] clamping scene {} end_frame {} → {}",
+                    s.index, s.end_frame, ffms2_frames - 1
+                );
+                s.end_frame = ffms2_frames - 1;
+            }
+            Some(s)
+        })
+        .collect();
 
     let total_chunks = scenes.len();
     let total_frames: u64 = scenes.iter().map(|s| s.frame_count()).sum();

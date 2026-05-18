@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::resume::TempDir;
+
 #[derive(Debug)]
 pub struct Job {
     pub encode_toml: PathBuf,
@@ -44,6 +46,11 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
                 tracing::debug!(file = %source_file.display(), "skip: output exists");
                 continue;
             }
+            if has_failed_marker(output_dir, &source_file) {
+                let stem = source_file.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+                tracing::warn!("[{stem}] permanently failed - delete .avxs_{stem}/.failed to retry");
+                continue;
+            }
             jobs.push(Job { encode_toml: encode_toml.clone(), source_file });
         }
     }
@@ -80,6 +87,14 @@ fn find_video_files(dir: &Path) -> Result<Vec<PathBuf>> {
 fn output_exists(output_dir: &Path, source_file: &Path) -> bool {
     let stem = source_file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     output_dir.join(format!("{stem}.mkv")).exists()
+}
+
+fn has_failed_marker(output_dir: &Path, source_file: &Path) -> bool {
+    let stem = match source_file.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return false,
+    };
+    TempDir::for_video(output_dir, stem).failed_path.exists()
 }
 
 pub fn ensure_processed_dir(input_dir: &Path) -> Result<PathBuf> {
