@@ -41,6 +41,7 @@ avxs pipeline controls. All flags default to `false` / disabled.
 | `crop` | Boolean | `false` | Detect black bars via `ffmpeg cropdetect` (5 samples at 10/25/40/55/70 % of the runtime, threshold 128 for HDR/10-bit). The detected crop is applied in the Y4M pipe **before** the encoder. Result is cached in `crop.cache` inside the temp directory. |
 | `keyint` | Boolean | `false` | Calculate `--keyint` from source FPS for a ~5 s keyframe distance (`round(fps × 5)`). Silently skipped if `keyint` is already set in `[encoder_params]`. |
 | `scale` | Integer | - | Maximum output height in pixels. The source is scaled down proportionally using Lanczos resampling if taller than this value. If the source (after crop) is already at or below this height, no scaling is applied. Example: `1080` encodes 4K content as 1080p while leaving 720p content untouched. Aspect ratio is always preserved. |
+| `bit_depth` | `8` \| `10` | - | Force the encoder input bit depth. Omitted = pass the source bit depth through (SVT-AV1 default: 8→8, 10→10). Set to `10` to convert 8-bit sources to 10-bit via FFMS2 (slightly better fidelity at ~5% size cost, see SVT-AV1 docs).|
 | `keep_temp` | Boolean | `false` | Keep temporary chunks and index files after encoding. |
 
 ```toml
@@ -49,6 +50,7 @@ hdr       = true
 crop      = true
 keyint    = true
 scale     = 1080
+bit_depth = 10
 keep_temp = false
 ```
 
@@ -188,6 +190,7 @@ hdr       = true
 crop      = true
 keyint    = true
 scale     = 1080
+bit_depth = 10
 keep_temp = false
 
 [audio]

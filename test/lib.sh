@@ -203,6 +203,15 @@ assert_color_primaries() {
         fail "color_primaries: expected $expected, got $actual ($file)"
 }
 
+assert_video_pix_fmt() {
+    local file="$1" expected="$2"
+    local actual
+    actual=$(ffprobe -v quiet -select_streams v:0 \
+        -show_entries stream=pix_fmt -of csv=p=0 "$file" 2>/dev/null | tr -d '\n')
+    [ "$actual" = "$expected" ] || \
+        fail "pix_fmt: expected $expected, got $actual ($file)"
+}
+
 assert_video_height_lt() {
     local file="$1" max="$2"
     local actual

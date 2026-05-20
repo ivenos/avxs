@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::config::{Config, Encoder};
-use crate::ffms2::{Crop, VideoSource};
+use crate::ffms2::{Crop, OpenOpts, VideoSource};
 use crate::paths::external_bin;
 use crate::resume::SceneEntry;
 
@@ -21,6 +21,8 @@ pub struct EncodeOptions {
     /// FPS from ffprobe; FFMS2 reports 0/0 for some exotic containers (e.g. DV) which breaks IVF timestamps.
     pub fps_num: u32,
     pub fps_den: u32,
+    /// Forced encoder input bit depth (8 or 10); None = pass source through.
+    pub target_bit_depth: Option<u8>,
 }
 
 pub fn encode_chunk(
@@ -46,10 +48,14 @@ pub fn encode_chunk(
 
     let mut stdin = BufWriter::with_capacity(256 * 1024, child.stdin.take().expect("encoder stdin unavailable"));
 
-    let mut vs = match opts.ffms2_target {
-        Some((w, h)) => VideoSource::open_scaled(&source_file, &index_file, w, h),
-        None         => VideoSource::open(&source_file, &index_file),
-    }
+    let mut vs = VideoSource::open(
+        &source_file,
+        &index_file,
+        OpenOpts {
+            target_size:      opts.ffms2_target,
+            target_bit_depth: opts.target_bit_depth,
+        },
+    )
     .context("open FFMS2 VideoSource")?;
     // Override FFMS2 fps with ffprobe value (FFMS2 returns 0/0 for some containers, corrupting IVF timestamps).
     vs.info.fps_num = opts.fps_num;
@@ -205,6 +211,7 @@ mod tests {
             crop: None,
             fps_num: 24,
             fps_den: 1,
+            target_bit_depth: None,
         };
 
         let out = PathBuf::from("/tmp/chunk.ivf");
@@ -241,6 +248,7 @@ mod tests {
             crop: None,
             fps_num: 24,
             fps_den: 1,
+            target_bit_depth: None,
         };
 
         let out = PathBuf::from("/tmp/chunk.ivf");
@@ -273,6 +281,7 @@ mod tests {
             crop: None,
             fps_num: 24,
             fps_den: 1,
+            target_bit_depth: None,
         };
 
         let out = PathBuf::from("/tmp/chunk.ivf");
@@ -310,6 +319,7 @@ mod tests {
             crop: None,
             fps_num: 24,
             fps_den: 1,
+            target_bit_depth: None,
         };
 
         let args = merged_encoder_args(&config, &opts);

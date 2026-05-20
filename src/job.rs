@@ -40,7 +40,8 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let source_path = job.source_file.clone();
     let index_path  = temp.index_path.clone();
     let video_info  = tokio::task::spawn_blocking(move || {
-        ffms2::VideoSource::open(&source_path, &index_path).map(|vs| vs.info.clone())
+        ffms2::VideoSource::open(&source_path, &index_path, ffms2::OpenOpts::default())
+            .map(|vs| vs.info.clone())
     })
     .await
     .context("spawn_blocking VideoSource")??;
@@ -109,6 +110,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         crop: scaled_crop,
         fps_num,
         fps_den,
+        target_bit_depth: config.avxs.bit_depth,
     });
 
     // Scene detection

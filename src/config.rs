@@ -34,6 +34,7 @@ pub struct AvxsConfig {
     #[serde(default)]
     pub keyint: bool,
     pub scale: Option<u32>,
+    pub bit_depth: Option<u8>,
     #[serde(default)]
     pub keep_temp: bool,
 }
@@ -149,6 +150,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if let Some(d) = self.avxs.bit_depth
+            && d != 8 && d != 10
+        {
+            bail!("avxs.bit_depth must be 8 or 10 (got {d})");
+        }
         if self.audio.mode == AudioMode::Encode {
             if self.audio.codec.is_none() {
                 bail!("audio.codec required when audio.mode = encode");
@@ -185,5 +191,39 @@ impl Config {
             });
         }
         args
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_bit_depth(d: Option<u8>) -> Config {
+        Config {
+            encoder: Encoder::SvtAv1,
+            encoder_params: HashMap::new(),
+            avxs: AvxsConfig { bit_depth: d, ..Default::default() },
+            audio: AudioConfig::default(),
+            subtitles: SubtitleConfig::default(),
+            scene_detection: SceneDetectionConfig::default(),
+        }
+    }
+
+    #[test]
+    fn bit_depth_8_and_10_are_valid() {
+        cfg_with_bit_depth(Some(8)).validate().unwrap();
+        cfg_with_bit_depth(Some(10)).validate().unwrap();
+        cfg_with_bit_depth(None).validate().unwrap();
+    }
+
+    #[test]
+    fn bit_depth_other_values_rejected() {
+        for d in [0u8, 9, 12, 16] {
+            let err = cfg_with_bit_depth(Some(d)).validate().unwrap_err();
+            assert!(
+                err.to_string().contains("bit_depth"),
+                "expected bit_depth error for {d}, got: {err}"
+            );
+        }
     }
 }

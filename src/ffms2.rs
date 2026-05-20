@@ -241,6 +241,20 @@ impl PixelFormat {
     }
 }
 
+fn pixfmt_for(sub: PixelSubsampling, depth: u8) -> Option<c_int> {
+    use PixelSubsampling::*;
+    let name = match (sub, depth) {
+        (Yuv420,  8) => "yuv420p",
+        (Yuv420, 10) => "yuv420p10le",
+        (Yuv422,  8) => "yuv422p",
+        (Yuv422, 10) => "yuv422p10le",
+        (Yuv444,  8) => "yuv444p",
+        (Yuv444, 10) => "yuv444p10le",
+        _ => return None,
+    };
+    Some(get_pixel_format(name))
+}
+
 fn detect_pixel_format(pix_fmt: c_int) -> PixelFormat {
     use PixelSubsampling::*;
     const TABLE: &[(&str, u32, PixelSubsampling)] = &[
@@ -336,27 +350,23 @@ impl Drop for VideoSource {
     }
 }
 
-impl VideoSource {
-    /// Open at native source resolution.
-    pub fn open(source_file: &Path, index_file: &Path) -> Result<Self> {
-        Self::open_inner(source_file, index_file, None)
-    }
+#[derive(Default, Clone, Copy)]
+pub struct OpenOpts {
+    /// Lanczos-scale target dimensions; None = native resolution.
+    pub target_size: Option<(u32, u32)>,
+    /// Force input bit depth (8 or 10); None = match source.
+    pub target_bit_depth: Option<u8>,
+}
 
-    /// Open with FFMS2 scaling to `target_w × target_h` using Lanczos resampling.
-    /// Use this when downscaling (e.g. 4K → 1080p).
-    pub fn open_scaled(
-        source_file: &Path,
-        index_file: &Path,
-        target_w: u32,
-        target_h: u32,
-    ) -> Result<Self> {
-        Self::open_inner(source_file, index_file, Some((target_w, target_h)))
+impl VideoSource {
+    pub fn open(source_file: &Path, index_file: &Path, opts: OpenOpts) -> Result<Self> {
+        Self::open_inner(source_file, index_file, opts)
     }
 
     fn open_inner(
         source_file: &Path,
         index_file: &Path,
-        target: Option<(u32, u32)>,
+        opts: OpenOpts,
     ) -> Result<Self> {
         let mut idx = Index::read(index_file)?;
         let track = idx.first_video_track()?;
@@ -382,15 +392,38 @@ impl VideoSource {
             bail!("FFMS_GetFrame(0) failed: {}", ei2.message());
         }
         let raw_pix_fmt = unsafe { (*first_frame).encoded_pixel_format };
-        let pixel_format = detect_pixel_format(raw_pix_fmt);
+        let mut pixel_format = detect_pixel_format(raw_pix_fmt);
 
         let frame_w = unsafe { (*first_frame).encoded_width };
         let frame_h = unsafe { (*first_frame).encoded_height };
 
-        let (out_w, out_h, resizer) = match target {
+        let (out_w, out_h, resizer) = match opts.target_size {
             Some((w, h)) => (w as c_int, h as c_int, FFMS_RESIZER_LANCZOS),
             None         => (frame_w, frame_h, FFMS_RESIZER_BICUBIC),
         };
+
+        // Depth conversion: pick a pixfmt with the same subsampling but the requested depth.
+        if let Some(depth) = opts.target_bit_depth
+            && depth as u32 != pixel_format.bit_depth
+        {
+            match pixfmt_for(pixel_format.subsampling, depth) {
+                Some(pf) => {
+                    tracing::info!(
+                        "bit-depth conversion: {}-bit → {}-bit",
+                        pixel_format.bit_depth, depth
+                    );
+                    pixel_format.pix_fmt = pf;
+                    pixel_format.bit_depth = depth as u32;
+                }
+                None => {
+                    unsafe { FFMS_DestroyVideoSource(ptr) }
+                    bail!(
+                        "no pixfmt available for {:?} at {}-bit",
+                        pixel_format.subsampling, depth
+                    );
+                }
+            }
+        }
 
         let target_formats = [pixel_format.pix_fmt, -1i32];
         let mut ei3 = ErrorInfo::new();

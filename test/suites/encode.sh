@@ -79,4 +79,49 @@ run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "SDR+hdr: no output"
 assert_log_contains    "HDR: SDR"
 assert_file_nonempty   "$O/test.mkv"
 
+# -- bit_depth=10 on 8-bit source: output is 10-bit, conversion logged --------
+I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[avxs]
+bit_depth = 10
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 8→10: no output"
+assert_video_pix_fmt "$O/test.mkv" "yuv420p10le"
+assert_log_contains  "bit-depth conversion: 8-bit → 10-bit"
+
+# -- bit_depth=8 on 10-bit source: output is 8-bit, conversion logged ---------
+I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/hdr10.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[avxs]
+bit_depth = 8
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 10→8: no output"
+assert_video_pix_fmt "$O/test.mkv" "yuv420p"
+assert_log_contains  "bit-depth conversion: 10-bit → 8-bit"
+
+# -- bit_depth matching source: no conversion log -----------------------------
+I="$WORKDIR/8/in"; O="$WORKDIR/8/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[avxs]
+bit_depth = 8
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth matching: no output"
+assert_video_pix_fmt    "$O/test.mkv" "yuv420p"
+assert_log_not_contains "bit-depth conversion"
+
 test_done
