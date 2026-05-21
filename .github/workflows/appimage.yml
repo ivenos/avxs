@@ -8,6 +8,8 @@ on:
 env:
   SVT_AV1_VERSION: v4.1.0
   SVT_AV1_HDR_VERSION: v4.1.0
+  # MR 2644 / commit 1f21a056: adds --hbd-mds CLI flag. Remove once shipped in a tagged release (>= v4.2).
+  SVT_AV1_PATCH_URL: https://gitlab.com/AOMediaCodec/SVT-AV1/-/commit/1f21a05614db24ec028f65155161e3a6cdd1fdde.patch
   FFMS2_VERSION: "5.0"
   RUST_VERSION: 1.95.0
 
@@ -54,6 +56,7 @@ jobs:
         run: |
           git clone --depth 1 --branch "$SVT_AV1_VERSION" \
             https://gitlab.com/AOMediaCodec/SVT-AV1.git /tmp/svt-av1
+          curl -sSfL "$SVT_AV1_PATCH_URL" | git -C /tmp/svt-av1 apply
           cmake -B /tmp/svt-av1/build /tmp/svt-av1 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \

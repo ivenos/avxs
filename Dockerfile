@@ -2,6 +2,10 @@
 
 ARG SVT_AV1_VERSION=v4.1.0
 ARG SVT_AV1_HDR_VERSION=v4.1.0
+# Cherry-picked patch on top of SVT_AV1_VERSION (not applied to the HDR fork).
+# MR 2644 / commit 1f21a056: adds --hbd-mds CLI flag for HBD-MD control.
+# Drop this ARG and the `git apply` line below once the change lands in a tagged release (>= v4.2).
+ARG SVT_AV1_PATCH_URL=https://gitlab.com/AOMediaCodec/SVT-AV1/-/commit/1f21a05614db24ec028f65155161e3a6cdd1fdde.patch
 ARG FFMS2_VERSION=5.0
 ARG RUST_VERSION=1.95.0
 
@@ -9,6 +13,7 @@ FROM alpine:3.23 AS builder
 
 ARG SVT_AV1_VERSION
 ARG SVT_AV1_HDR_VERSION
+ARG SVT_AV1_PATCH_URL
 ARG FFMS2_VERSION
 ARG RUST_VERSION
 ARG TARGETARCH
@@ -34,6 +39,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN git clone --depth 1 --branch ${SVT_AV1_VERSION} \
         https://gitlab.com/AOMediaCodec/SVT-AV1.git /svt-av1 && \
+    curl -sSfL "${SVT_AV1_PATCH_URL}" | git -C /svt-av1 apply && \
     cmake -B /svt-av1/build /svt-av1 \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
