@@ -7,7 +7,7 @@ ARG SVT_AV1_HDR_VERSION=v4.1.0
 # Drop this ARG and the `git apply` line below once the change lands in a tagged release (>= v4.2).
 ARG SVT_AV1_PATCH_URL=https://gitlab.com/AOMediaCodec/SVT-AV1/-/commit/1f21a05614db24ec028f65155161e3a6cdd1fdde.patch
 ARG FFMS2_VERSION=5.0
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.96.0
 
 FROM alpine:3.23 AS builder
 
