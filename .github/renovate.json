@@ -2,24 +2,32 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
   "dependencyDashboard": false,
+  "labels": ["dependencies"],
   "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "commitMessagePrefix": "ci:"
+    },
+    {
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "commitMessagePrefix": "build(docker):"
+    },
     {
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["patch"],
       "automerge": true
     },
     {
-      "enabled": false,
-      "matchPackageNames": ["ghcr.io/ivenos/avxs"]
+      "matchPackageNames": ["ivenos/avxs"],
+      "enabled": false
     }
   ],
   "customManagers": [
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
-      "matchStrings": [
-        "ARG SVT_AV1_VERSION=(?<currentValue>[^\\n]+)"
-      ],
+      "matchStrings": ["ARG SVT_AV1_VERSION=(?<currentValue>[^\\n]+)"],
       "datasourceTemplate": "gitlab-releases",
       "depNameTemplate": "AOMediaCodec/SVT-AV1",
       "versioningTemplate": "semver"
@@ -27,9 +35,7 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
-      "matchStrings": [
-        "ARG SVT_AV1_HDR_VERSION=(?<currentValue>[^\\n]+)"
-      ],
+      "matchStrings": ["ARG SVT_AV1_HDR_VERSION=(?<currentValue>[^\\n]+)"],
       "datasourceTemplate": "github-tags",
       "depNameTemplate": "juliobbv-p/svt-av1-hdr",
       "versioningTemplate": "semver"
@@ -37,9 +43,7 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
-      "matchStrings": [
-        "ARG FFMS2_VERSION=(?<currentValue>[^\\n]+)"
-      ],
+      "matchStrings": ["ARG FFMS2_VERSION=(?<currentValue>[^\\n]+)"],
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "FFMS/ffms2",
       "versioningTemplate": "loose"
@@ -47,9 +51,7 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
-      "matchStrings": [
-        "ARG RUST_VERSION=(?<currentValue>[^\\n]+)"
-      ],
+      "matchStrings": ["ARG RUST_VERSION=(?<currentValue>[^\\n]+)"],
       "datasourceTemplate": "docker",
       "depNameTemplate": "rust",
       "versioningTemplate": "semver"
@@ -57,9 +59,7 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
-      "matchStrings": [
-        "SVT_AV1_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
-      ],
+      "matchStrings": ["SVT_AV1_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
       "datasourceTemplate": "gitlab-releases",
       "depNameTemplate": "AOMediaCodec/SVT-AV1",
       "versioningTemplate": "semver"
@@ -67,9 +67,7 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
-      "matchStrings": [
-        "SVT_AV1_HDR_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
-      ],
+      "matchStrings": ["SVT_AV1_HDR_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
       "datasourceTemplate": "github-tags",
       "depNameTemplate": "juliobbv-p/svt-av1-hdr",
       "versioningTemplate": "semver"
@@ -77,9 +75,7 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
-      "matchStrings": [
-        "FFMS2_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
-      ],
+      "matchStrings": ["FFMS2_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "FFMS/ffms2",
       "versioningTemplate": "loose"
@@ -87,9 +83,7 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
-      "matchStrings": [
-        "RUST_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
-      ],
+      "matchStrings": ["RUST_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
       "datasourceTemplate": "docker",
       "depNameTemplate": "rust",
       "versioningTemplate": "semver"
@@ -97,9 +91,7 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Cargo\\.toml$/"],
-      "matchStrings": [
-        "rust-version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
-      ],
+      "matchStrings": ["rust-version\\s*=\\s*\"(?<currentValue>[^\"]+)\""],
       "datasourceTemplate": "docker",
       "depNameTemplate": "rust",
       "versioningTemplate": "semver"
