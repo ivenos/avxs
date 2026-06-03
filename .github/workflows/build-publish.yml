@@ -12,6 +12,10 @@ env:
   GITHUB_IMAGE: ghcr.io/ivenos/avxs
   DOCKERHUB_IMAGE: ivenos/avxs
 
+# Least privilege by default; jobs that publish opt into more below.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest

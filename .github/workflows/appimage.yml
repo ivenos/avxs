@@ -13,6 +13,10 @@ env:
   FFMS2_VERSION: "5.0"
   RUST_VERSION: 1.96.0
 
+# Least privilege by default; the appimage job opts into contents: write to attach release assets.
+permissions:
+  contents: read
+
 jobs:
   appimage:
     runs-on: ${{ matrix.runner }}
