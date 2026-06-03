@@ -68,7 +68,7 @@ For AppImage, prefix the command: `RUST_LOG=debug ./avxs-x86_64.AppImage`.
 | `encoder` value | Binary | Version |
 |---|---|---|
 | `svt-av1` | `SvtAv1EncApp` | [v4.1.0](https://gitlab.com/AOMediaCodec/SVT-AV1) |
-| `svt-av1-hdr` | `SvtAv1EncApp-hdr` | [v4.1.0](https://github.com/juliobbv-p/svt-av1-hdr) |
+| `svt-av1-hdr` | `SvtAv1EncApp-hdr` | [ce5178a](https://github.com/juliobbv-p/svt-av1-hdr/commit/ce5178ad013c6c3edc200fa8724d4afb0daf0cde) (main) |
 
 ## License
 

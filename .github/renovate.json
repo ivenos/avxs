@@ -35,10 +35,10 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
-      "matchStrings": ["ARG SVT_AV1_HDR_VERSION=(?<currentValue>[^\\n]+)"],
-      "datasourceTemplate": "github-tags",
-      "depNameTemplate": "juliobbv-p/svt-av1-hdr",
-      "versioningTemplate": "semver"
+      "matchStrings": ["ARG SVT_AV1_HDR_REF=(?<currentDigest>[^\\n]+)"],
+      "currentValueTemplate": "main",
+      "datasourceTemplate": "git-refs",
+      "depNameTemplate": "https://github.com/juliobbv-p/svt-av1-hdr"
     },
     {
       "customType": "regex",
@@ -67,10 +67,10 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
-      "matchStrings": ["SVT_AV1_HDR_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
-      "datasourceTemplate": "github-tags",
-      "depNameTemplate": "juliobbv-p/svt-av1-hdr",
-      "versioningTemplate": "semver"
+      "matchStrings": ["SVT_AV1_HDR_REF:\\s*\"?(?<currentDigest>[^\"\\s]+)\"?"],
+      "currentValueTemplate": "main",
+      "datasourceTemplate": "git-refs",
+      "depNameTemplate": "https://github.com/juliobbv-p/svt-av1-hdr"
     },
     {
       "customType": "regex",
@@ -95,6 +95,23 @@
       "datasourceTemplate": "docker",
       "depNameTemplate": "rust",
       "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)README\\.md$/"],
+      "matchStrings": ["\\[(?<currentValue>v[0-9][^\\]]*)\\]\\(https://gitlab\\.com/AOMediaCodec/SVT-AV1\\)"],
+      "datasourceTemplate": "gitlab-releases",
+      "depNameTemplate": "AOMediaCodec/SVT-AV1",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)README\\.md$/"],
+      "matchStrings": ["\\[[0-9a-f]+\\]\\(https://github\\.com/juliobbv-p/svt-av1-hdr/commit/(?<currentDigest>[0-9a-f]+)\\)"],
+      "currentValueTemplate": "main",
+      "datasourceTemplate": "git-refs",
+      "depNameTemplate": "https://github.com/juliobbv-p/svt-av1-hdr",
+      "autoReplaceStringTemplate": "[{{{replace '^(.{7}).*' '$1' newDigest}}}](https://github.com/juliobbv-p/svt-av1-hdr/commit/{{{newDigest}}})"
     }
   ]
 }

@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 ARG SVT_AV1_VERSION=v4.1.0
-ARG SVT_AV1_HDR_VERSION=v4.1.0
+# Rolling-release repo: pin a main commit, bump via PR.
+ARG SVT_AV1_HDR_REF=ce5178ad013c6c3edc200fa8724d4afb0daf0cde
 # Cherry-picked patch on top of SVT_AV1_VERSION (not applied to the HDR fork).
 # MR 2644 / commit 1f21a056: adds --hbd-mds CLI flag for HBD-MD control.
 # Drop this ARG and the `git apply` line below once the change lands in a tagged release (>= v4.2).
@@ -12,7 +13,7 @@ ARG RUST_VERSION=1.96.0
 FROM alpine:3.23 AS builder
 
 ARG SVT_AV1_VERSION
-ARG SVT_AV1_HDR_VERSION
+ARG SVT_AV1_HDR_REF
 ARG SVT_AV1_PATCH_URL
 ARG FFMS2_VERSION
 ARG RUST_VERSION
@@ -50,8 +51,9 @@ RUN git clone --depth 1 --branch ${SVT_AV1_VERSION} \
     cmake --install /svt-av1/build && \
     rm -rf /svt-av1
 
-RUN git clone --depth 1 --branch ${SVT_AV1_HDR_VERSION} \
+RUN git clone --filter=blob:none --no-checkout \
         https://github.com/juliobbv-p/svt-av1-hdr.git /svt-av1-hdr && \
+    git -C /svt-av1-hdr checkout ${SVT_AV1_HDR_REF} && \
     cmake -B /svt-av1-hdr/build /svt-av1-hdr \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local/hdr \

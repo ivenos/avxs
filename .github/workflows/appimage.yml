@@ -7,7 +7,8 @@ on:
 
 env:
   SVT_AV1_VERSION: v4.1.0
-  SVT_AV1_HDR_VERSION: v4.1.0
+  # Rolling-release repo: pin a main commit, bump via PR.
+  SVT_AV1_HDR_REF: ce5178ad013c6c3edc200fa8724d4afb0daf0cde
   # MR 2644 / commit 1f21a056: adds --hbd-mds CLI flag. Remove once shipped in a tagged release (>= v4.2).
   SVT_AV1_PATCH_URL: https://gitlab.com/AOMediaCodec/SVT-AV1/-/commit/1f21a05614db24ec028f65155161e3a6cdd1fdde.patch
   FFMS2_VERSION: "5.0"
@@ -71,8 +72,9 @@ jobs:
 
       - name: Build SVT-AV1-hdr
         run: |
-          git clone --depth 1 --branch "$SVT_AV1_HDR_VERSION" \
+          git clone --filter=blob:none --no-checkout \
             https://github.com/juliobbv-p/svt-av1-hdr.git /tmp/svt-av1-hdr
+          git -C /tmp/svt-av1-hdr checkout "$SVT_AV1_HDR_REF"
           cmake -B /tmp/svt-av1-hdr/build /tmp/svt-av1-hdr \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local/hdr \
