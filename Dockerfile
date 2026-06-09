@@ -6,7 +6,7 @@ ARG SVT_AV1_HDR_REF=1bd66be2828a7eeb43ea210aff8cbc2911f16196
 ARG FFMS2_VERSION=5.0
 ARG RUST_VERSION=1.96.0
 
-FROM alpine:3.23 AS builder
+FROM alpine:3.24 AS builder
 
 ARG SVT_AV1_VERSION
 ARG SVT_AV1_HDR_REF
@@ -82,7 +82,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETAR
     cargo build --release && \
     cp /src/target/release/avxs /avxs
 
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 
 RUN apk add --no-cache \
         ffmpeg \
