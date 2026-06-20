@@ -25,8 +25,18 @@ pub enum Encoder {
     SvtAv1Hdr,
 }
 
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoMode {
+    #[default]
+    Encode,
+    Copy,
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct AvxsConfig {
+    #[serde(default)]
+    pub video: VideoMode,
     #[serde(default)]
     pub hdr: bool,
     #[serde(default)]
@@ -320,6 +330,14 @@ mod tests {
 
     fn audio(toml_str: &str) -> AudioConfig {
         toml::from_str(toml_str).expect("parse audio config")
+    }
+
+    #[test]
+    fn video_mode_defaults_to_encode() {
+        let c: Config = toml::from_str(r#"encoder = "svt-av1""#).unwrap();
+        assert_eq!(c.avxs.video, VideoMode::Encode);
+        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[avxs]\nvideo = \"copy\"").unwrap();
+        assert_eq!(c.avxs.video, VideoMode::Copy);
     }
 
     #[test]

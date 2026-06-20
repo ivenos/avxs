@@ -37,6 +37,7 @@ avxs pipeline controls. All flags default to `false` / disabled.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `video` | `"encode"` \| `"copy"` | `"encode"` | `copy` passes the source video through untouched and only runs the audio and subtitle steps. The video-only options below (`hdr`, `crop`, `keyint`, `scale`, `bit_depth`) and `[encoder_params]` are ignored in this mode; `encoder` is still required but unused. |
 | `hdr` | Boolean | `false` | Detect HDR type and pass color metadata (`--color-primaries`, `--transfer-characteristics`, `--matrix-coefficients`, `--chroma-sample-position`, `--content-light`, `--mastering-display`) to the encoder automatically. Works for HDR10, HLG, and Dolby Vision/HDR10+ (fallback to HDR10 metadata). Independent of the encoder binary chosen. |
 | `crop` | Boolean | `false` | Detect black bars via `ffmpeg cropdetect` (5 samples at 10/25/40/55/70 % of the runtime, threshold 128 for HDR/10-bit). The detected crop is applied in the Y4M pipe **before** the encoder. Result is cached in `crop.cache` inside the temp directory. |
 | `keyint` | Boolean | `false` | Calculate `--keyint` from source FPS for a ~5 s keyframe distance (`round(fps × 5)`). Silently skipped if `keyint` is already set in `[encoder_params]`. |

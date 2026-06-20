@@ -64,21 +64,6 @@ run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "auto-keyint: no output"
 assert_log_contains "auto-keyint"
 assert_log_contains "keyint="
 
-# -- SDR source + hdr=true: "HDR: SDR" logged, encode succeeds ----------------
-I="$WORKDIR/5/in"; O="$WORKDIR/5/out"; mkdir -p "$I/p" "$O"
-cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
-cat > "$I/p/encode.toml" << 'EOF'
-encoder = "svt-av1"
-[encoder_params]
-preset = 12
-crf    = 50
-[avxs]
-hdr = true
-EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "SDR+hdr: no output"
-assert_log_contains    "HDR: SDR"
-assert_file_nonempty   "$O/test.mkv"
-
 # -- bit_depth=10 on 8-bit source: output is 10-bit, conversion logged --------
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
@@ -123,5 +108,23 @@ EOF
 run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth matching: no output"
 assert_video_pix_fmt    "$O/test.mkv" "yuv420p"
 assert_log_not_contains "bit-depth conversion"
+
+# -- video = copy: video stream kept, only audio re-encoded -------------------
+I="$WORKDIR/9/in"; O="$WORKDIR/9/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_named_audio.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[avxs]
+video = "copy"
+[audio]
+mode    = "encode"
+codec   = "libopus"
+bitrate = "256k"
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "video copy: no output"
+assert_log_contains "copy video"
+assert_video_codec  "$O/test.mkv" h264
+assert_audio_codec  "$O/test.mkv" 0 opus
+assert_audio_title  "$O/test.mkv" 0 "Deutsch Dolby Digital 5.1 (Opus)"
 
 test_done

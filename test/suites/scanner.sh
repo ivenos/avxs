@@ -24,7 +24,7 @@ crf    = 50
 EOF
 printf "sentinel" > "$O/test.mkv"
 SENTINEL_SIZE=$(wc -c < "$O/test.mkv")
-AVXS_RUST_LOG=debug run_avxs_timed "$I" "$O" 15
+AVXS_RUST_LOG=debug run_avxs_timed "$I" "$O" 15 "skip: output exists"
 CURRENT_SIZE=$(wc -c < "$O/test.mkv" 2>/dev/null || echo 0)
 [ "$CURRENT_SIZE" = "$SENTINEL_SIZE" ] || fail "existing output was overwritten"
 assert_file_exists     "$I/p/test.mkv"
@@ -69,18 +69,21 @@ AVXS_LOGS=$(docker logs "$CID" 2>&1) || true
 docker rm -f "$CID" >/dev/null 2>&1 || true
 assert_log_contains "poll_s=42"
 
-# -- .mp4 extension recognized by scanner -------------------------------------
+# -- .mp4 and .webm extensions both recognized by scanner ---------------------
 I="$WORKDIR/5/in"; O="$WORKDIR/5/out"; mkdir -p "$I/p" "$O"
-cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mp4"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/a.mp4"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/b.webm"
 cat > "$I/p/encode.toml" << 'EOF'
 encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "mp4 extension: no output"
-assert_file_nonempty "$O/test.mkv"
-assert_file_exists   "$I/processed/test.mp4"
+run_avxs "$I" "$O" "$O/b.mkv" 240 || fail "extensions: no output"
+assert_file_nonempty "$O/a.mkv"
+assert_file_nonempty "$O/b.mkv"
+assert_file_exists   "$I/processed/a.mp4"
+assert_file_exists   "$I/processed/b.webm"
 
 # -- invalid AVXS_POLL_INTERVAL: warning logged, default used -----------------
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I" "$O"
@@ -95,18 +98,5 @@ sleep 5
 AVXS_LOGS=$(docker logs "$CID" 2>&1) || true
 docker rm -f "$CID" >/dev/null 2>&1 || true
 assert_log_contains "invalid value"
-
-# -- .webm extension recognized -----------------------------------------------
-I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
-cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.webm"
-cat > "$I/p/encode.toml" << 'EOF'
-encoder = "svt-av1"
-[encoder_params]
-preset = 12
-crf    = 50
-EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "webm extension: no output"
-assert_file_nonempty "$O/test.mkv"
-assert_file_exists   "$I/processed/test.webm"
 
 test_done

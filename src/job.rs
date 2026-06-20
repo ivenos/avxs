@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
 use crate::audio;
-use crate::config::Config;
+use crate::config::{Config, VideoMode};
 use crate::encode::{self, EncodeOptions};
 use crate::ffms2::{self, Crop};
 use crate::paths::external_bin;
@@ -28,6 +28,10 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let temp = TempDir::for_video(&ctx.output_dir, stem);
     temp.create_dirs()?;
+
+    if config.avxs.video == VideoMode::Copy {
+        return run_copy(job, ctx, &config, stem, &temp).await;
+    }
 
     if !temp.index_path.exists() {
         tracing::info!("[{stem}] indexing");
@@ -279,6 +283,53 @@ pub fn handle_failure(_job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Er
     if let Err(e) = std::fs::write(&temp.failed_path, format!("{err:#}")) {
         tracing::warn!("[{stem}] could not write failure marker: {e:#}");
     }
+}
+
+async fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &TempDir) -> Result<()> {
+    let ignored = ignored_video_opts(&config.avxs);
+    if !ignored.is_empty() {
+        tracing::warn!("[{stem}] video = copy: ignoring {}", ignored.join(", "));
+    }
+
+    let audio_plan = audio::plan(&job.source_file, &config.audio).await?;
+    for line in audio_plan.summary_lines() {
+        tracing::info!("[{stem}] audio {line}");
+    }
+
+    tracing::info!("[{stem}] copy video, processing audio");
+    let audio_path = audio::process_plan(&job.source_file, &temp.path, &audio_plan).await?;
+
+    let subtitle_sel = crate::subtitle::select_tracks(&job.source_file, &config.subtitles).await?;
+
+    let final_output = ctx.output_dir.join(format!("{stem}.mkv"));
+    tracing::info!("[{stem}] muxing → {}", final_output.display());
+    audio::mux_final(&job.source_file, &audio_path, &job.source_file, &final_output, &subtitle_sel).await?;
+
+    tracing::info!("[{stem}] validating output");
+    encode::validate_output(&final_output).await?;
+
+    let processed_dir = crate::scanner::ensure_processed_dir(&ctx.input_dir)?;
+    let dest = processed_dir.join(job.source_file.file_name().unwrap());
+    std::fs::rename(&job.source_file, &dest)
+        .with_context(|| format!("move source: {} → {}", job.source_file.display(), dest.display()))?;
+
+    if !config.avxs.keep_temp {
+        std::fs::remove_dir_all(&temp.path)
+            .with_context(|| format!("remove temp dir: {}", temp.path.display()))?;
+    }
+
+    tracing::info!("[{stem}] done");
+    Ok(())
+}
+
+fn ignored_video_opts(a: &crate::config::AvxsConfig) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if a.hdr { v.push("hdr"); }
+    if a.crop { v.push("crop"); }
+    if a.keyint { v.push("keyint"); }
+    if a.scale.is_some() { v.push("scale"); }
+    if a.bit_depth.is_some() { v.push("bit_depth"); }
+    v
 }
 
 /// Returns `(ffms2_target, scaled_crop, scene_vf_filter)`.

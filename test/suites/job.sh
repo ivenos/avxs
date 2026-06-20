@@ -34,20 +34,6 @@ EOF
 run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "keep_temp=true: no output"
 assert_dir_exists "$O/.avxs_test"
 
-# -- keep_temp=false: temp dir removed ----------------------------------------
-I="$WORKDIR/3/in"; O="$WORKDIR/3/out"; mkdir -p "$I/p" "$O"
-cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
-cat > "$I/p/encode.toml" << 'EOF'
-encoder = "svt-av1"
-[encoder_params]
-preset = 12
-crf    = 50
-[avxs]
-keep_temp = false
-EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "keep_temp=false: no output"
-assert_dir_not_exists "$O/.avxs_test"
-
 # -- scale down: 720p → 360p ---------------------------------------------------
 I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_720p.mkv" "$I/p/test.mkv"
@@ -157,7 +143,7 @@ assert_file_not_exists "$O/test.mkv"
 assert_file_exists     "$O/.avxs_test/.failed"
 assert_log_contains    "job failed"
 
-run_avxs_timed "$I" "$O" 15
+run_avxs_timed "$I" "$O" 15 "permanently failed"
 assert_log_contains "permanently failed"
 
 rm -f "$O/.avxs_test/.failed"

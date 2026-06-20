@@ -3,7 +3,7 @@
 #
 # Provides:
 #   run_avxs        INPUT OUTPUT EXPECTED_FILE [TIMEOUT_S]
-#   run_avxs_timed  INPUT OUTPUT WAIT_S
+#   run_avxs_timed  INPUT OUTPUT WAIT_S [LOG_PATTERN]
 #   assert_*        various assertion helpers
 #   test_done       call at end of each test case to exit with correct code
 #
@@ -75,11 +75,12 @@ run_avxs() {
     [ -e "$expected" ] && return 0 || return 1
 }
 
-# Run avxs for a fixed number of seconds, then stop.
-# Useful for negative tests where no output is expected.
+# Run avxs for up to WAIT seconds, then stop. With an optional LOG_PATTERN it
+# returns as soon as that pattern appears in the logs (capped at WAIT); without
+# one it waits the full WAIT. Useful for negative tests where no output is expected.
 # Always returns 0; sets AVXS_LOGS.
 run_avxs_timed() {
-    local input="$1" output="$2" wait="${3:-15}"
+    local input="$1" output="$2" wait="${3:-15}" pattern="${4:-}"
     AVXS_LOGS=""
 
     local cid
@@ -91,7 +92,18 @@ run_avxs_timed() {
         -e "RUST_LOG=${AVXS_RUST_LOG:-info}" \
         "${AVXS_IMAGE}")
 
-    sleep "$wait"
+    if [ -n "$pattern" ]; then
+        local elapsed=0
+        while [ "$elapsed" -lt "$wait" ]; do
+            docker logs "$cid" 2>&1 | sed "s/${_ESC}\[[0-9;]*m//g" | \
+                grep -qF "$pattern" && break
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+    else
+        sleep "$wait"
+    fi
+
     AVXS_LOGS=$(docker logs "$cid" 2>&1) || true
     docker rm -f "$cid" >/dev/null 2>&1 || true
     return 0

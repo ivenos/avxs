@@ -14,7 +14,7 @@ encoder = "x264"
 preset = 12
 crf    = 50
 EOF
-run_avxs_timed "$I" "$O" 15
+run_avxs_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "ERROR"
 
@@ -22,7 +22,7 @@ assert_log_contains    "ERROR"
 I="$WORKDIR/2/in"; O="$WORKDIR/2/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 printf 'this is not valid toml !!!\n' > "$I/p/encode.toml"
-run_avxs_timed "$I" "$O" 15
+run_avxs_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "ERROR"
 
@@ -38,7 +38,7 @@ crf    = 50
 mode    = "encode"
 bitrate = "96k"
 EOF
-run_avxs_timed "$I" "$O" 15
+run_avxs_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "ERROR"
 
@@ -53,7 +53,7 @@ crf    = 50
 [audio.codec_rules]
 ac3 = { mode = "encode", codec = "aac" }
 EOF
-run_avxs_timed "$I" "$O" 15
+run_avxs_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "ERROR"
 
@@ -102,7 +102,7 @@ crf    = 50
 mode  = "encode"
 codec = "aac"
 EOF
-run_avxs_timed "$I" "$O" 15
+run_avxs_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "ERROR"
 
@@ -117,7 +117,7 @@ crf    = 50
 [avxs]
 bit_depth = 12
 EOF
-run_avxs_timed "$I" "$O" 15
+run_avxs_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "bit_depth"
 
