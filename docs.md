@@ -58,14 +58,43 @@ keep_temp = false
 
 ## `[audio]`
 
-Controls how audio tracks are carried over from the source file.
+Controls how audio tracks are carried over from the source file. This is also
+the default profile: any track not matched by a more specific rule uses it.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `mode` | `"copy"` \| `"encode"` | `"copy"` | Global default for all audio tracks |
+| `mode` | `"copy"` \| `"encode"` | `"copy"` | Copy or re-encode |
 | `codec` | String | - | FFmpeg codec name, e.g. `"libopus"` - required when `mode = "encode"` |
-| `bitrate` | String | - | Target bitrate, e.g. `"192k"` - required when `mode = "encode"` |
+| `bitrate` | String \| table | - | Target bitrate, single value or per-layout table (see below). Required when encoding to a lossy codec |
+| `options` | table | `{}` | Extra encoder options, passed as `-<key> <value>`, e.g. `{ compression_level = 12 }` |
 | `language_whitelist` | String array | `[]` | Keep only tracks with these language tags (ISO 639-2). Empty = keep all |
+
+The channel count is always taken from the source. FLAC passes the source layout
+through unchanged; Opus normalizes the layout name to one its encoder accepts but
+never changes the channel count.
+
+### Bitrate per channel layout
+
+`bitrate` is either a single string applied to every track, or a table keyed by
+layout. avxs detects each track's channel count and picks the matching entry;
+`default` covers anything not listed.
+
+| Channels | Key | Channels | Key |
+|---|---|---|---|
+| 1 | `mono` | 5 | `5.0` |
+| 2 | `stereo` | 6 | `5.1` |
+| 3 | `3.0` | 7 | `6.1` |
+| 4 | `quad` | 8 | `7.1` |
+
+```toml
+[audio]
+mode    = "encode"
+codec   = "libopus"
+bitrate = { stereo = "192k", "5.1" = "320k", "7.1" = "512k", default = "192k" }
+```
+
+Lossless codecs (`flac`, `alac`, `wavpack`, `pcm_*`) ignore bitrate, so it may be
+omitted for them.
 
 ### Language whitelist
 
@@ -79,30 +108,62 @@ mode = "copy"
 
 Common ISO 639-2 codes: `deu`/`ger` (German), `eng` (English), `fra`/`fre` (French), `jpn` (Japanese), `und` (undefined).
 
-### Global encode
+---
 
-Re-encode all audio tracks to a different codec:
+## `[audio.lossless]`
+
+Override applied to tracks whose **source** is lossless. Any field left unset
+inherits from `[audio]`, so you usually only set `codec` and maybe `options`.
+
+Lossless is detected automatically from ffmpeg's own codec table (`ffmpeg
+-codecs`), so every codec ffmpeg flags as lossless is covered without a hardcoded
+list. `dts` is special-cased: it counts as lossless only in its Master Audio
+profile (`DTS-HD MA`), since ffprobe reports lossy and lossless DTS under the
+same codec name.
 
 ```toml
 [audio]
 mode    = "encode"
 codec   = "libopus"
-bitrate = "192k"
+bitrate = { stereo = "192k", "5.1" = "320k", "7.1" = "512k", default = "192k" }
+
+[audio.lossless]
+codec   = "flac"
+options = { compression_level = 12 }
+```
+
+Result: lossless sources become FLAC at maximum compression, everything else
+becomes Opus.
+
+### Track titles and pre-encode summary
+
+Re-encoded tracks keep their source name and get the new codec appended in
+parentheses, e.g. `Deutsch Dolby Digital Plus 7.1` becomes `Deutsch Dolby
+Digital Plus 7.1 (Opus)`. Untitled tracks get the codec name alone; copied
+tracks keep their name unchanged.
+
+Before encoding, avxs logs one line per kept audio track showing what was
+detected and how it will be handled, alongside the video encoder summary:
+
+```
+audio track 0: deu eac3 5.1 (lossy) -> Opus 320k
+audio track 1: ger truehd 7.1 (lossless) -> FLAC
 ```
 
 ---
 
 ## `[audio.codec_rules]`
 
-Allows different treatment per source codec. The key is the codec name as reported by `ffprobe` (lowercase).
-
-When a matching rule exists for a track's codec, it takes precedence over the global `[audio]` default.
+Per source codec override, keyed by the codec name as reported by `ffprobe`
+(lowercase). A matching rule has the highest precedence and, like
+`[audio.lossless]`, inherits any unset field from `[audio]`.
 
 | Key in rule | Type | Description |
 |---|---|---|
-| `mode` | `"copy"` \| `"encode"` | Required |
-| `codec` | String | FFmpeg codec name - required when `mode = "encode"` |
-| `bitrate` | String | Target bitrate - required when `mode = "encode"` |
+| `mode` | `"copy"` \| `"encode"` | Inherits from `[audio]` if unset |
+| `codec` | String | Inherits from `[audio]` if unset |
+| `bitrate` | String \| table | Inherits from `[audio]` if unset |
+| `options` | table | Inherits from `[audio]` if unset |
 
 ```toml
 [audio]
@@ -111,14 +172,13 @@ mode = "copy"   # default: copy all codecs not matched by a rule
 
 [audio.codec_rules]
 eac3   = { mode = "encode", codec = "libopus", bitrate = "192k" }
-truehd = { mode = "encode", codec = "libopus", bitrate = "256k" }
-dts    = { mode = "encode", codec = "libopus", bitrate = "192k" }
+opus   = { mode = "copy" }   # don't re-encode existing Opus
 ac3    = { mode = "encode", codec = "libopus", bitrate = "128k" }
 ```
 
-**Processing order:**
+**Resolution order for each kept track:**
 1. Filter by language whitelist (empty list = no filter)
-2. For each kept track: apply the matching `codec_rules` entry if one exists, otherwise fall back to the global default
+2. Settings resolve as `codec_rules[codec]` → `[audio.lossless]` (lossless sources only) → `[audio]`. Whichever matches first wins; unset fields inherit from `[audio]`.
 3. If no tracks remain after filtering, audio is omitted entirely (warning logged)
 
 Common codec names reported by ffprobe: `eac3`, `ac3`, `aac`, `truehd`, `dts`, `flac`, `mp3`, `opus`, `vorbis`.
@@ -195,12 +255,16 @@ keep_temp = false
 
 [audio]
 language_whitelist = ["deu", "ger"]
-mode = "copy"
+mode    = "encode"
+codec   = "libopus"
+bitrate = { stereo = "192k", "5.1" = "320k", "7.1" = "512k", default = "192k" }
+
+[audio.lossless]
+codec   = "flac"
+options = { compression_level = 12 }
 
 [audio.codec_rules]
-eac3   = { mode = "encode", codec = "libopus", bitrate = "192k" }
-truehd = { mode = "encode", codec = "libopus", bitrate = "256k" }
-dts    = { mode = "encode", codec = "libopus", bitrate = "192k" }
+opus = { mode = "copy" }   # don't re-encode existing Opus
 
 [subtitles]
 language_whitelist = ["deu", "eng"]

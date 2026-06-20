@@ -167,6 +167,12 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         .collect();
     tracing::info!("[{stem}] encoder args: {}", summary.join(" "));
 
+    // Audio plan (logged before the encode, next to the video summary)
+    let audio_plan = audio::plan(&job.source_file, &config.audio).await?;
+    for line in audio_plan.summary_lines() {
+        tracing::info!("[{stem}] audio {line}");
+    }
+
     tracing::info!("[{stem}] encoding: {total_chunks} chunks, {num_workers} worker(s)");
 
     // Parallel chunk encoding
@@ -238,7 +244,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     encode::concat_chunks(&chunk_paths, &video_only, &temp.path).await?;
 
     tracing::info!("[{stem}] processing audio");
-    let audio_path = audio::process(&job.source_file, &temp.path, &config.audio).await?;
+    let audio_path = audio::process_plan(&job.source_file, &temp.path, &audio_plan).await?;
 
     let subtitle_sel = crate::subtitle::select_tracks(&job.source_file, &config.subtitles).await?;
 

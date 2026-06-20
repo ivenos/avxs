@@ -174,4 +174,101 @@ assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
 
+# -- lossless override: flac source → flac, no bitrate, options applied --------
+I="$WORKDIR/11/in"; O="$WORKDIR/11/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_71audio.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[audio]
+mode    = "encode"
+codec   = "libopus"
+bitrate = "128k"
+[audio.lossless]
+codec   = "flac"
+options = { compression_level = 12 }
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "lossless override: no output"
+assert_audio_track_count "$O/test.mkv" 1
+assert_audio_channels    "$O/test.mkv" 0 8
+assert_audio_codec       "$O/test.mkv" 0 flac
+assert_audio_title       "$O/test.mkv" 0 "FLAC"   # untitled source → marker only
+
+# -- lossy default + per-layout bitrate: lossy tracks → opus -------------------
+I="$WORKDIR/12/in"; O="$WORKDIR/12/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_multiaudio.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[audio]
+mode    = "encode"
+codec   = "libopus"
+bitrate = { mono = "64k", stereo = "128k", default = "96k" }
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "per-layout: no output"
+assert_audio_track_count "$O/test.mkv" 3
+assert_audio_codec       "$O/test.mkv" 0 opus
+assert_audio_codec       "$O/test.mkv" 1 opus
+assert_audio_codec       "$O/test.mkv" 2 opus
+assert_audio_title       "$O/test.mkv" 0 "Opus"   # untitled source → marker only
+
+# -- codec_rules beats lossless detection; per-layout 7.1 → opus --------------
+I="$WORKDIR/13/in"; O="$WORKDIR/13/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_71audio.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[audio]
+mode    = "encode"
+codec   = "libopus"
+bitrate = "128k"
+[audio.lossless]
+codec   = "flac"
+[audio.codec_rules]
+flac = { mode = "encode", codec = "libopus", bitrate = { "7.1" = "512k", default = "128k" } }
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "rule beats lossless: no output"
+assert_audio_track_count "$O/test.mkv" 1
+assert_audio_channels    "$O/test.mkv" 0 8
+assert_audio_codec       "$O/test.mkv" 0 opus
+
+# -- track title: copy keeps the source name unchanged ------------------------
+I="$WORKDIR/14/in"; O="$WORKDIR/14/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_named_audio.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[audio]
+mode = "copy"
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "title copy: no output"
+assert_audio_codec "$O/test.mkv" 0 ac3
+assert_audio_title "$O/test.mkv" 0 "Deutsch Dolby Digital 5.1"
+
+# -- track title: encode appends the target codec marker ----------------------
+I="$WORKDIR/15/in"; O="$WORKDIR/15/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_named_audio.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[audio]
+mode    = "encode"
+codec   = "libopus"
+bitrate = { "5.1" = "320k", default = "192k" }
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "title encode: no output"
+assert_audio_codec    "$O/test.mkv" 0 opus
+assert_audio_channels "$O/test.mkv" 0 6
+assert_audio_title    "$O/test.mkv" 0 "Deutsch Dolby Digital 5.1 (Opus)"
+
 test_done

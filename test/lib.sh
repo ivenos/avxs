@@ -185,6 +185,15 @@ assert_audio_channels() {
         fail "audio track $idx channels: expected $expected, got $actual ($file)"
 }
 
+assert_audio_title() {
+    local file="$1" idx="$2" expected="$3"
+    local actual
+    actual=$(ffprobe -v quiet -select_streams "a:${idx}" \
+        -show_entries stream_tags=title -of csv=p=0 "$file" 2>/dev/null | tr -d '\n')
+    [ "$actual" = "$expected" ] || \
+        fail "audio track $idx title: expected '$expected', got '$actual' ($file)"
+}
+
 assert_color_transfer() {
     local file="$1" expected="$2"
     local actual

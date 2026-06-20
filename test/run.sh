@@ -115,6 +115,14 @@ $FF -f lavfi -i "color=c=navy:size=640x360:rate=24" \
     -c:a flac \
     sdr_71audio.mkv
 
+echo "  sdr_named_audio.mkv"
+$FF -f lavfi -i "color=c=teal:size=640x360:rate=24" \
+    -f lavfi -i "anullsrc=channel_layout=5.1:sample_rate=48000" \
+    -t 10 -map 0:v -map 1:a \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+    -c:a ac3 -metadata:s:a:0 title="Deutsch Dolby Digital 5.1" -metadata:s:a:0 language=deu \
+    sdr_named_audio.mkv
+
 echo "  sdr_subtitles.mkv"
 printf "1\n00:00:01,000 --> 00:00:04,000\nEnglish subtitle text.\n\n" > /tmp/eng.srt
 printf "1\n00:00:01,000 --> 00:00:04,000\nDeutscher Untertiteltext.\n\n" > /tmp/deu.srt

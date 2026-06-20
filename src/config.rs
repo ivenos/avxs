@@ -60,18 +60,52 @@ pub struct AudioConfig {
     #[serde(default)]
     pub mode: AudioMode,
     pub codec: Option<String>,
-    pub bitrate: Option<String>,
+    pub bitrate: Option<Bitrate>,
+    #[serde(default)]
+    pub options: HashMap<String, toml::Value>,
     #[serde(default)]
     pub language_whitelist: Vec<String>,
+    /// Override for lossless sources; unset fields inherit from [audio].
+    pub lossless: Option<AudioProfile>,
     #[serde(default)]
-    pub codec_rules: HashMap<String, AudioCodecRule>,
+    pub codec_rules: HashMap<String, AudioProfile>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct AudioCodecRule {
-    pub mode: AudioMode,
+/// Override whose unset fields inherit from [audio].
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct AudioProfile {
+    pub mode: Option<AudioMode>,
     pub codec: Option<String>,
-    pub bitrate: Option<String>,
+    pub bitrate: Option<Bitrate>,
+    #[serde(default)]
+    pub options: HashMap<String, toml::Value>,
+}
+
+/// A single bitrate, or a per-layout table keyed by layout name (plus `default`).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum Bitrate {
+    Single(String),
+    PerLayout(HashMap<String, String>),
+}
+
+impl Bitrate {
+    pub fn resolve(&self, channels: Option<u32>) -> Option<&str> {
+        match self {
+            Bitrate::Single(s) => Some(s.as_str()),
+            Bitrate::PerLayout(map) => channels
+                .and_then(|c| map.get(layout_name(c)))
+                .or_else(|| map.get("default"))
+                .map(String::as_str),
+        }
+    }
+}
+
+pub struct ResolvedAudio<'a> {
+    pub mode: AudioMode,
+    pub codec: Option<&'a str>,
+    pub bitrate: Option<&'a Bitrate>,
+    pub options: &'a HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default, PartialEq, Clone, Copy)]
@@ -80,6 +114,64 @@ pub enum AudioMode {
     #[default]
     Copy,
     Encode,
+}
+
+/// Layout name for a channel count (per-layout bitrate key).
+pub fn layout_name(channels: u32) -> &'static str {
+    match channels {
+        0 | 1 => "mono",
+        2 => "stereo",
+        3 => "3.0",
+        4 => "quad",
+        5 => "5.0",
+        6 => "5.1",
+        7 => "6.1",
+        _ => "7.1",
+    }
+}
+
+/// True if the output codec is lossless (bitrate then irrelevant).
+pub fn output_is_lossless(codec: &str) -> bool {
+    matches!(codec, "flac" | "alac" | "wavpack" | "tta") || codec.starts_with("pcm_")
+}
+
+/// Stringify a TOML value for the ffmpeg/encoder CLI (booleans as 1/0).
+pub(crate) fn toml_value_to_arg(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s)  => s.clone(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f)   => f.to_string(),
+        toml::Value::Boolean(b) => if *b { "1".into() } else { "0".into() },
+        other                   => other.to_string(),
+    }
+}
+
+impl AudioConfig {
+    /// Resolve a track: codec_rules, then lossless override, then [audio].
+    pub fn resolve(&self, codec_name: &str, is_lossless: bool) -> ResolvedAudio<'_> {
+        if let Some(rule) = self.codec_rules.get(codec_name) {
+            return self.overlay(rule);
+        }
+        if is_lossless && let Some(p) = &self.lossless {
+            return self.overlay(p);
+        }
+        ResolvedAudio {
+            mode: self.mode,
+            codec: self.codec.as_deref(),
+            bitrate: self.bitrate.as_ref(),
+            options: &self.options,
+        }
+    }
+
+    /// Apply an override over [audio], inheriting unset fields.
+    fn overlay<'a>(&'a self, ov: &'a AudioProfile) -> ResolvedAudio<'a> {
+        ResolvedAudio {
+            mode: ov.mode.unwrap_or(self.mode),
+            codec: ov.codec.as_deref().or(self.codec.as_deref()),
+            bitrate: ov.bitrate.as_ref().or(self.bitrate.as_ref()),
+            options: if ov.options.is_empty() { &self.options } else { &ov.options },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
@@ -155,23 +247,14 @@ impl Config {
         {
             bail!("avxs.bit_depth must be 8 or 10 (got {d})");
         }
-        if self.audio.mode == AudioMode::Encode {
-            if self.audio.codec.is_none() {
-                bail!("audio.codec required when audio.mode = encode");
-            }
-            if self.audio.bitrate.is_none() {
-                bail!("audio.bitrate required when audio.mode = encode");
-            }
+        validate_audio("audio", self.audio.mode, self.audio.codec.as_deref(), self.audio.bitrate.as_ref())?;
+        if let Some(p) = &self.audio.lossless {
+            let r = self.audio.overlay(p);
+            validate_audio("audio.lossless", r.mode, r.codec, r.bitrate)?;
         }
         for (source_codec, rule) in &self.audio.codec_rules {
-            if rule.mode == AudioMode::Encode {
-                if rule.codec.is_none() {
-                    bail!("audio.codec_rules.{source_codec}: codec required when mode = encode");
-                }
-                if rule.bitrate.is_none() {
-                    bail!("audio.codec_rules.{source_codec}: bitrate required when mode = encode");
-                }
-            }
+            let r = self.audio.overlay(rule);
+            validate_audio(&format!("audio.codec_rules.{source_codec}"), r.mode, r.codec, r.bitrate)?;
         }
         Ok(())
     }
@@ -182,16 +265,24 @@ impl Config {
         let mut args = Vec::with_capacity(entries.len() * 2);
         for (k, v) in entries {
             args.push(format!("--{k}"));
-            args.push(match v {
-                toml::Value::String(s)  => s.clone(),
-                toml::Value::Integer(i) => i.to_string(),
-                toml::Value::Float(f)   => f.to_string(),
-                toml::Value::Boolean(b) => if *b { "1".into() } else { "0".into() },
-                other                   => other.to_string(),
-            });
+            args.push(toml_value_to_arg(v));
         }
         args
     }
+}
+
+/// Encode needs a codec; lossy codecs also need a bitrate.
+fn validate_audio(ctx: &str, mode: AudioMode, codec: Option<&str>, bitrate: Option<&Bitrate>) -> Result<()> {
+    if mode != AudioMode::Encode {
+        return Ok(());
+    }
+    let Some(codec) = codec else {
+        bail!("{ctx}: codec required when mode = encode");
+    };
+    if !output_is_lossless(codec) && bitrate.is_none() {
+        bail!("{ctx}: bitrate required when mode = encode ({codec} is lossy)");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -225,5 +316,81 @@ mod tests {
                 "expected bit_depth error for {d}, got: {err}"
             );
         }
+    }
+
+    fn audio(toml_str: &str) -> AudioConfig {
+        toml::from_str(toml_str).expect("parse audio config")
+    }
+
+    #[test]
+    fn bitrate_parses_single_and_per_layout() {
+        let a = audio(r#"bitrate = "192k""#);
+        assert!(matches!(a.bitrate, Some(Bitrate::Single(ref s)) if s == "192k"));
+
+        let a = audio(r#"bitrate = { stereo = "192k", "5.1" = "320k" }"#);
+        assert!(matches!(a.bitrate, Some(Bitrate::PerLayout(_))));
+    }
+
+    #[test]
+    fn layout_name_maps_channel_counts() {
+        assert_eq!(layout_name(1), "mono");
+        assert_eq!(layout_name(2), "stereo");
+        assert_eq!(layout_name(6), "5.1");
+        assert_eq!(layout_name(8), "7.1");
+        assert_eq!(layout_name(16), "7.1");
+    }
+
+    #[test]
+    fn bitrate_resolve_by_channels_with_default() {
+        let b = Bitrate::PerLayout(HashMap::from([
+            ("stereo".into(), "192k".into()),
+            ("5.1".into(), "320k".into()),
+            ("default".into(), "256k".into()),
+        ]));
+        assert_eq!(b.resolve(Some(2)), Some("192k"));
+        assert_eq!(b.resolve(Some(6)), Some("320k"));
+        assert_eq!(b.resolve(Some(8)), Some("256k")); // falls back to default
+        assert_eq!(b.resolve(None), Some("256k"));
+
+        let single = Bitrate::Single("128k".into());
+        assert_eq!(single.resolve(Some(6)), Some("128k"));
+    }
+
+    #[test]
+    fn output_lossless_classification() {
+        assert!(output_is_lossless("flac"));
+        assert!(output_is_lossless("pcm_s24le"));
+        assert!(!output_is_lossless("libopus"));
+        assert!(!output_is_lossless("aac"));
+    }
+
+    #[test]
+    fn flac_encode_needs_no_bitrate_but_opus_does() {
+        validate_audio("audio", AudioMode::Encode, Some("flac"), None).unwrap();
+        assert!(validate_audio("audio", AudioMode::Encode, Some("libopus"), None).is_err());
+        assert!(validate_audio("audio", AudioMode::Encode, None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_precedence_and_inheritance() {
+        let cfg = audio(
+            r#"
+            mode    = "encode"
+            codec   = "libopus"
+            bitrate = "192k"
+            [lossless]
+            codec   = "flac"
+            [codec_rules]
+            opus = { mode = "copy" }
+            "#,
+        );
+        assert_eq!(cfg.resolve("opus", false).mode, AudioMode::Copy);
+        // lossless override keeps inherited mode + bitrate
+        let r = cfg.resolve("truehd", true);
+        assert_eq!(r.mode, AudioMode::Encode);
+        assert_eq!(r.codec, Some("flac"));
+        let r = cfg.resolve("eac3", false);
+        assert_eq!(r.codec, Some("libopus"));
+        assert!(matches!(r.bitrate, Some(Bitrate::Single(s)) if s == "192k"));
     }
 }
