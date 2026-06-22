@@ -33,7 +33,8 @@ pub fn encode_chunk(
     config: &Config,
     opts: &EncodeOptions,
 ) -> Result<u64> {
-    let encoder_name = encoder_binary(config.encoder);
+    let encoder = config.encoder.context("encoder is required when video is encoded")?;
+    let encoder_name = encoder_binary(encoder);
     let encoder_bin = external_bin(encoder_name);
     let encoder_args = build_encoder_args(config, &output_path, opts)?;
 
@@ -196,7 +197,7 @@ mod tests {
         params.insert("preset".to_string(), toml::Value::Integer(6));
 
         let config = Config {
-            encoder: Encoder::SvtAv1,
+            encoder: Some(Encoder::SvtAv1),
             encoder_params: params,
             avxs: AvxsConfig::default(),
             audio: AudioConfig::default(),
@@ -233,7 +234,7 @@ mod tests {
         params.insert("keyint".to_string(), toml::Value::Integer(240));
 
         let config = Config {
-            encoder: Encoder::SvtAv1,
+            encoder: Some(Encoder::SvtAv1),
             encoder_params: params,
             avxs: AvxsConfig::default(),
             audio: AudioConfig::default(),
@@ -266,7 +267,7 @@ mod tests {
         use std::collections::HashMap;
 
         let config = Config {
-            encoder: Encoder::SvtAv1,
+            encoder: Some(Encoder::SvtAv1),
             encoder_params: HashMap::new(),
             avxs: AvxsConfig::default(),
             audio: AudioConfig::default(),
@@ -301,7 +302,7 @@ mod tests {
         params.insert("color-primaries".to_string(), toml::Value::Integer(1));
 
         let config = Config {
-            encoder: Encoder::SvtAv1,
+            encoder: Some(Encoder::SvtAv1),
             encoder_params: params,
             avxs: AvxsConfig::default(),
             audio: AudioConfig::default(),

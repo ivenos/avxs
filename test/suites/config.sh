@@ -106,6 +106,18 @@ run_avxs_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "ERROR"
 
+# -- no encoder without video=copy: validation error --------------------------
+I="$WORKDIR/9/in"; O="$WORKDIR/9/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+[encoder_params]
+preset = 12
+crf    = 50
+EOF
+run_avxs_timed "$I" "$O" 15 "ERROR"
+assert_file_not_exists "$O/test.mkv"
+assert_log_contains    "encoder is required"
+
 # -- avxs.bit_depth = 12: validation error ------------------------------------
 I="$WORKDIR/8/in"; O="$WORKDIR/8/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"

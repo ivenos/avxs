@@ -280,6 +280,9 @@ pub fn handle_failure(_job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Er
     tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
 
     let temp = TempDir::for_video(&ctx.output_dir, stem);
+    if let Err(e) = temp.create_dirs() {
+        tracing::warn!("[{stem}] could not create temp dir for failure marker: {e:#}");
+    }
     if let Err(e) = std::fs::write(&temp.failed_path, format!("{err:#}")) {
         tracing::warn!("[{stem}] could not write failure marker: {e:#}");
     }

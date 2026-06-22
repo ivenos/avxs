@@ -5,7 +5,7 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    pub encoder: Encoder,
+    pub encoder: Option<Encoder>,
     #[serde(default)]
     pub encoder_params: HashMap<String, toml::Value>,
     #[serde(default)]
@@ -252,6 +252,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.avxs.video != VideoMode::Copy && self.encoder.is_none() {
+            bail!("encoder is required unless avxs.video = \"copy\"");
+        }
         if let Some(d) = self.avxs.bit_depth
             && d != 8 && d != 10
         {
@@ -301,7 +304,7 @@ mod tests {
 
     fn cfg_with_bit_depth(d: Option<u8>) -> Config {
         Config {
-            encoder: Encoder::SvtAv1,
+            encoder: Some(Encoder::SvtAv1),
             encoder_params: HashMap::new(),
             avxs: AvxsConfig { bit_depth: d, ..Default::default() },
             audio: AudioConfig::default(),

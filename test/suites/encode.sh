@@ -109,11 +109,10 @@ run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth matching: no output"
 assert_video_pix_fmt    "$O/test.mkv" "yuv420p"
 assert_log_not_contains "bit-depth conversion"
 
-# -- video = copy: video stream kept, only audio re-encoded -------------------
+# -- video = copy: video kept, only audio re-encoded, no encoder needed -------
 I="$WORKDIR/9/in"; O="$WORKDIR/9/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_named_audio.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
-encoder = "svt-av1"
 [avxs]
 video = "copy"
 [audio]
