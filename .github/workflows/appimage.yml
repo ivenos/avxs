@@ -8,7 +8,7 @@ on:
 env:
   SVT_AV1_VERSION: v4.1.0
   # Rolling-release repo: pin a main commit, bump via PR.
-  SVT_AV1_HDR_REF: 1bd66be2828a7eeb43ea210aff8cbc2911f16196
+  SVT_AV1_HDR_REF: cfb4e17693ae16945a7fe288d45437243d96c12e
   FFMS2_VERSION: "5.0"
   VMAF_VERSION: v3.2.0
   RUST_VERSION: 1.96.0

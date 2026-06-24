@@ -387,7 +387,7 @@ extra_split_sec = 10
 | `encoder` value | Binary | Version |
 |---|---|---|
 | `svt-av1` | `SvtAv1EncApp` | [v4.1.0](https://gitlab.com/AOMediaCodec/SVT-AV1) |
-| `svt-av1-hdr` | `SvtAv1EncApp-hdr` | [1bd66be](https://github.com/juliobbv-p/svt-av1-hdr/commit/1bd66be2828a7eeb43ea210aff8cbc2911f16196) (main) |
+| `svt-av1-hdr` | `SvtAv1EncApp-hdr` | [cfb4e17](https://github.com/juliobbv-p/svt-av1-hdr/commit/cfb4e17693ae16945a7fe288d45437243d96c12e) (main) |
 
 ## License
 
