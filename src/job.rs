@@ -9,9 +9,11 @@ use crate::config::{Config, VideoMode};
 use crate::encode::{self, EncodeOptions};
 use crate::ffms2::{self, Crop};
 use crate::paths::external_bin;
-use crate::resume::{DoneFile, SceneEntry, TempDir};
+use crate::resume::{CrfCache, DoneFile, SceneEntry, TempDir};
 use crate::scanner::Job;
 use crate::scene;
+use crate::target_quality;
+use crate::vmaf;
 use crate::workers;
 
 pub struct JobContext {
@@ -89,8 +91,8 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         None
     };
 
-    // Auto-Scale: derive FFMS2 target dimensions and remapped crop
-    let (ffms2_target, scaled_crop, scene_vf) = compute_output_params(
+    // Auto-Scale: source-space crop plus an ffmpeg scale target (crop before scale)
+    let (scale_target, crop, scene_vf) = compute_output_params(
         video_info.width,
         video_info.height,
         crop_str.as_deref(),
@@ -110,8 +112,8 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let encode_opts = Arc::new(EncodeOptions {
         hdr_args,
         keyint: auto_keyint,
-        ffms2_target,
-        crop: scaled_crop,
+        scale: scale_target,
+        crop,
         fps_num,
         fps_den,
         target_bit_depth: config.avxs.bit_depth,
@@ -177,6 +179,26 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         tracing::info!("[{stem}] audio {line}");
     }
 
+    // Target quality: pick the VMAF model once (fails early if v1 is missing)
+    let output_height = encode_opts.scale.map(|(_, h)| h)
+        .or(encode_opts.crop.map(|c| c.h))
+        .unwrap_or(video_info.height);
+    let (tq_model, crf_cache): (Option<String>, Option<Arc<CrfCache>>) =
+        if let Some(tq) = &config.target_quality {
+            vmaf::ensure_available().await?;
+            let model = vmaf::model_for_height(output_height).to_string();
+            tracing::info!(
+                "[{stem}] target quality: VMAF {} (model {model}, crf {}-{}, {} probes, probe preset {})",
+                tq.vmaf, tq.min_crf, tq.max_crf, tq.probes, tq.probe_preset
+            );
+            if config.encoder_params.contains_key("crf") {
+                tracing::info!("[{stem}] target quality: crf in encoder_params used only as a probe seed");
+            }
+            (Some(model), Some(Arc::new(CrfCache::load_or_create(&temp.tq_path)?)))
+        } else {
+            (None, None)
+        };
+
     tracing::info!("[{stem}] encoding: {total_chunks} chunks, {num_workers} worker(s)");
 
     // Parallel chunk encoding
@@ -209,14 +231,51 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         let stem_owned       = stem.to_owned();
         let total_c          = total_chunks;
         let total_f          = total_frames;
+        let tq               = config.target_quality.clone();
+        let tq_model         = tq_model.clone();
+        let crf_cache        = crf_cache.clone();
+        let temp_dir         = temp.path.clone();
+        let tpw              = threads_per_worker;
 
         set.spawn(async move {
             let _permit = sem.acquire().await.context("acquire semaphore")?;
 
             let scene_frames = scene.frame_count();
+
+            let crf_override = match (&tq, &tq_model, &crf_cache) {
+                (Some(tq), Some(model), Some(cache)) => {
+                    if let Some(c) = cache.get(&chunk_key).await {
+                        Some(c)
+                    } else {
+                        let s2 = source.clone();
+                        let i2 = index.clone();
+                        let td = temp_dir.clone();
+                        let c2 = Arc::clone(&cfg);
+                        let o2 = Arc::clone(&opts);
+                        let tq2 = tq.clone();
+                        let m2 = model.clone();
+                        let scene2 = scene.clone();
+                        let solved = tokio::task::spawn_blocking(move || {
+                            let ctx = target_quality::ProbeContext {
+                                source: &s2, index: &i2, temp_dir: &td,
+                                config: &c2, opts: &o2, tq: &tq2, model: &m2, n_threads: tpw,
+                            };
+                            target_quality::solve_chunk_crf(&ctx, &scene2)
+                        })
+                        .await
+                        .context("spawn_blocking solve_chunk_crf")??;
+                        cache.insert(&chunk_key, solved).await?;
+                        tracing::info!("[{stem_owned}] chunk {chunk_key} target crf {solved}");
+                        Some(solved)
+                    }
+                }
+                _ => None,
+            };
+
+            let overrides    = encode::EncodeOverrides { crf: crf_override, preset: None };
             let t0           = std::time::Instant::now();
             let size_bytes   = tokio::task::spawn_blocking(move || {
-                encode::encode_chunk(source, index, scene, chunk_path, &cfg, &opts)
+                encode::encode_chunk(source, index, scene, chunk_path, &cfg, &opts, overrides)
             })
             .await
             .context("spawn_blocking encode_chunk")??;
@@ -335,9 +394,9 @@ fn ignored_video_opts(a: &crate::config::AvxsConfig) -> Vec<&'static str> {
     v
 }
 
-/// Returns `(ffms2_target, scaled_crop, scene_vf_filter)`.
-/// FFMS2 scales the full source frame; crop is remapped into the scaled space.
-/// `scene_vf` works in source-space (ffmpeg handles crop+scale in one filter).
+/// Returns `(scale_target, crop, scene_vf_filter)`.
+/// Crop is in source space and applied before scaling; `scale_target` is the ffmpeg
+/// scale size for the cropped content. `scene_vf` mirrors crop+scale for detection.
 fn compute_output_params(
     src_w: u32,
     src_h: u32,
@@ -347,9 +406,9 @@ fn compute_output_params(
 ) -> (Option<(u32, u32)>, Option<Crop>, Option<String>) {
     let src_crop = crop_str.and_then(Crop::from_str);
 
-    let (eff_w, eff_h, eff_x, eff_y) = match src_crop {
-        Some(c) => (c.w, c.h, c.x, c.y),
-        None    => (src_w, src_h, 0, 0),
+    let (eff_w, eff_h) = match src_crop {
+        Some(c) => (c.w, c.h),
+        None    => (src_w, src_h),
     };
 
     let scale_factor: f64 = match target_height {
@@ -357,39 +416,18 @@ fn compute_output_params(
         _ => 1.0,
     };
 
-    if scale_factor < 1.0 {
-        tracing::info!(
-            "[{stem}] auto-scale: {eff_w}×{eff_h} → {}×{} (factor {scale_factor:.4})",
-            round_down_even((eff_w as f64 * scale_factor) as u32),
-            round_down_even((eff_h as f64 * scale_factor) as u32),
-        );
-    }
+    let scene_vf = build_scene_vf(crop_str, scale_factor, eff_w, eff_h);
 
-    // scene detection vf filter (uses source-space coordinates directly)
-    let scene_vf: Option<String> = build_scene_vf(crop_str, scale_factor, eff_w, eff_h);
-
-    if scale_factor == 1.0 {
-        // No scaling - return src_crop unchanged for the FFMS2 pipeline
-        return (None, src_crop, scene_vf);
-    }
-
-    // Scaling active: FFMS2 scales the full source frame
-    let ffms2_w = round_down_even((src_w as f64 * scale_factor) as u32);
-    let ffms2_h = round_down_even((src_h as f64 * scale_factor) as u32);
-
-    // Map crop into scaled space (only when original had black bars)
-    let scaled_crop = if src_crop.is_some() {
-        Some(Crop {
-            w: round_down_even((eff_w as f64 * scale_factor) as u32),
-            h: round_down_even((eff_h as f64 * scale_factor) as u32),
-            x: round_down_even((eff_x as f64 * scale_factor) as u32),
-            y: round_down_even((eff_y as f64 * scale_factor) as u32),
-        })
+    let scale_target = if scale_factor < 1.0 {
+        let tw = round_down_even((eff_w as f64 * scale_factor) as u32);
+        let th = round_down_even((eff_h as f64 * scale_factor) as u32);
+        tracing::info!("[{stem}] auto-scale: {eff_w}×{eff_h} → {tw}×{th} (factor {scale_factor:.4})");
+        Some((tw, th))
     } else {
         None
     };
 
-    (Some((ffms2_w, ffms2_h)), scaled_crop, scene_vf)
+    (scale_target, src_crop, scene_vf)
 }
 
 /// ffmpeg -vf filter for scene detection (source-space crop + optional scale).

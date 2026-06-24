@@ -10,6 +10,8 @@ mod resume;
 mod scanner;
 mod scene;
 mod subtitle;
+mod target_quality;
+mod vmaf;
 mod workers;
 
 use anyhow::{Context, Result};

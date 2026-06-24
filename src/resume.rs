@@ -84,11 +84,47 @@ impl DoneFile {
     }
 }
 
+/// Per-chunk solved CRF cache for target quality, so a resume skips re-probing.
+pub struct CrfCache {
+    pub path: PathBuf,
+    state: Mutex<HashMap<String, u32>>,
+}
+
+impl CrfCache {
+    pub fn load_or_create(path: &Path) -> Result<Self> {
+        let state = if path.exists() {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("read tq.json: {}", path.display()))?;
+            serde_json::from_str(&raw)
+                .with_context(|| format!("parse tq.json: {}", path.display()))?
+        } else {
+            HashMap::new()
+        };
+        Ok(Self { path: path.to_owned(), state: Mutex::new(state) })
+    }
+
+    pub async fn get(&self, chunk_key: &str) -> Option<u32> {
+        self.state.lock().await.get(chunk_key).copied()
+    }
+
+    pub async fn insert(&self, chunk_key: &str, crf: u32) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.insert(chunk_key.to_owned(), crf);
+        let json = serde_json::to_string_pretty(&*state)?;
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename {} → {}", tmp.display(), self.path.display()))
+    }
+}
+
 pub struct TempDir {
     pub path: PathBuf,
     pub index_path: PathBuf,
     pub scenes_path: PathBuf,
     pub done_path: PathBuf,
+    pub tq_path: PathBuf,
     pub failed_path: PathBuf,
     pub chunks_dir: PathBuf,
     pub crop_cache: PathBuf,
@@ -100,10 +136,11 @@ impl TempDir {
         let index_path  = path.join("frame-index.ffindex");
         let scenes_path = path.join("scenes.json");
         let done_path   = path.join("done.json");
+        let tq_path     = path.join("tq.json");
         let failed_path = path.join(".failed");
         let chunks_dir  = path.join("chunks");
         let crop_cache  = path.join("crop.cache");
-        Self { path, index_path, scenes_path, done_path, failed_path, chunks_dir, crop_cache }
+        Self { path, index_path, scenes_path, done_path, tq_path, failed_path, chunks_dir, crop_cache }
     }
 
     pub fn create_dirs(&self) -> Result<()> {

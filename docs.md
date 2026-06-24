@@ -33,6 +33,33 @@ Keys correspond to SVT-AV1 long flags without `--`. Values can be strings, integ
 
 ---
 
+## `[target_quality]`
+
+Targets a VMAF score per chunk instead of a fixed `crf`. avxs probes each chunk at a few CRF values, measures VMAF against the source, and encodes at the CRF that hits the target. Requires `avxs.video = "encode"`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `vmaf` | Float | - | Target VMAF score (required) |
+| `min_crf` | Integer | `18` | Lower bound of the CRF search |
+| `max_crf` | Integer | `45` | Upper bound of the CRF search |
+| `probes` | Integer | `4` | Maximum probe encodes per chunk |
+| `probe_preset` | Integer | `13` | SVT-AV1 preset for probe encodes (`13` = fastest) |
+| `tolerance_under` | Float | `0.5` | Accept a probe up to this far below the target |
+| `tolerance_over` | Float | `2.0` | Accept a probe up to this far above the target |
+
+```toml
+[target_quality]
+vmaf = 95
+```
+
+The VMAF model is selected automatically from the output height: VMAF v1 1080p (`vmaf_v1.0.16_3d0h`) below 1440p, VMAF v1 4K (`vmaf_v1.0.16_1d5h_2160`) at 1440p and above. avxs bundles the `vmaf` tool (libvmaf 3.2.0 with the v1 models built in), so no extra setup is needed. VMAF is measured at 10-bit against the source after the same crop and scale as the encode.
+
+Probes use the fastest preset by default, so the final encode (at your `[encoder_params]` preset) lands at or slightly above the target. `tolerance_under` and `tolerance_over` are asymmetric on purpose: overshooting quality is cheaper to accept than undershooting it.
+
+`crf` in `[encoder_params]` is ignored while target quality is active (it is used only as the first probe seed). Solved CRFs are cached in `tq.json` so a resume does not re-probe.
+
+---
+
 ## `[avxs]`
 
 avxs pipeline controls. All flags default to `false` / disabled.

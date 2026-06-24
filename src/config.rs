@@ -16,6 +16,8 @@ pub struct Config {
     pub subtitles: SubtitleConfig,
     #[serde(default)]
     pub scene_detection: SceneDetectionConfig,
+    /// Per-chunk VMAF target instead of a fixed CRF. None = fixed CRF.
+    pub target_quality: Option<TargetQualityConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
@@ -241,6 +243,35 @@ impl SceneDetectionConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct TargetQualityConfig {
+    /// VMAF score to target per chunk.
+    pub vmaf: f64,
+    #[serde(default = "TargetQualityConfig::default_min_crf")]
+    pub min_crf: u32,
+    #[serde(default = "TargetQualityConfig::default_max_crf")]
+    pub max_crf: u32,
+    #[serde(default = "TargetQualityConfig::default_probes")]
+    pub probes: u32,
+    #[serde(default = "TargetQualityConfig::default_probe_preset")]
+    pub probe_preset: u32,
+    /// Accept a probe that lands up to this far below the target.
+    #[serde(default = "TargetQualityConfig::default_tolerance_under")]
+    pub tolerance_under: f64,
+    /// Accept a probe that lands up to this far above the target.
+    #[serde(default = "TargetQualityConfig::default_tolerance_over")]
+    pub tolerance_over: f64,
+}
+
+impl TargetQualityConfig {
+    fn default_min_crf() -> u32 { 18 }
+    fn default_max_crf() -> u32 { 45 }
+    fn default_probes() -> u32 { 4 }
+    fn default_probe_preset() -> u32 { 13 }
+    fn default_tolerance_under() -> f64 { 0.5 }
+    fn default_tolerance_over() -> f64 { 2.0 }
+}
+
 impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -259,6 +290,29 @@ impl Config {
             && d != 8 && d != 10
         {
             bail!("avxs.bit_depth must be 8 or 10 (got {d})");
+        }
+        if let Some(tq) = &self.target_quality {
+            if self.avxs.video == VideoMode::Copy {
+                bail!("target_quality requires avxs.video = \"encode\"");
+            }
+            if !(tq.vmaf > 0.0 && tq.vmaf <= 100.0) {
+                bail!("target_quality.vmaf must be in (0, 100] (got {})", tq.vmaf);
+            }
+            if tq.min_crf >= tq.max_crf {
+                bail!("target_quality.min_crf must be < max_crf ({} >= {})", tq.min_crf, tq.max_crf);
+            }
+            if tq.max_crf > 63 {
+                bail!("target_quality.max_crf must be <= 63 (got {})", tq.max_crf);
+            }
+            if tq.probes < 2 {
+                bail!("target_quality.probes must be >= 2 (got {})", tq.probes);
+            }
+            if tq.probe_preset > 13 {
+                bail!("target_quality.probe_preset must be 0..=13 (got {})", tq.probe_preset);
+            }
+            if tq.tolerance_under < 0.0 || tq.tolerance_over < 0.0 {
+                bail!("target_quality tolerances must be >= 0");
+            }
         }
         validate_audio("audio", self.audio.mode, self.audio.codec.as_deref(), self.audio.bitrate.as_ref())?;
         if let Some(p) = &self.audio.lossless {
@@ -310,6 +364,7 @@ mod tests {
             audio: AudioConfig::default(),
             subtitles: SubtitleConfig::default(),
             scene_detection: SceneDetectionConfig::default(),
+            target_quality: None,
         }
     }
 
@@ -413,5 +468,39 @@ mod tests {
         let r = cfg.resolve("eac3", false);
         assert_eq!(r.codec, Some("libopus"));
         assert!(matches!(r.bitrate, Some(Bitrate::Single(s)) if s == "192k"));
+    }
+
+    #[test]
+    fn target_quality_defaults_and_valid() {
+        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95").unwrap();
+        c.validate().unwrap();
+        let tq = c.target_quality.unwrap();
+        assert_eq!((tq.min_crf, tq.max_crf, tq.probes, tq.probe_preset), (18, 45, 4, 13));
+        assert_eq!((tq.tolerance_under, tq.tolerance_over), (0.5, 2.0));
+    }
+
+    #[test]
+    fn target_quality_rejects_bad_values() {
+        let bad = [
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 0",
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 101",
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmin_crf = 40\nmax_crf = 30",
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmax_crf = 70",
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nprobes = 1",
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nprobe_preset = 14",
+        ];
+        for t in bad {
+            let c: Config = toml::from_str(t).unwrap();
+            assert!(c.validate().is_err(), "should reject:\n{t}");
+        }
+    }
+
+    #[test]
+    fn target_quality_requires_encode_video() {
+        let c: Config = toml::from_str(
+            "encoder = \"svt-av1\"\n[avxs]\nvideo = \"copy\"\n[target_quality]\nvmaf = 95",
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
     }
 }

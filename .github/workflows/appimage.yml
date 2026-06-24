@@ -10,6 +10,7 @@ env:
   # Rolling-release repo: pin a main commit, bump via PR.
   SVT_AV1_HDR_REF: 1bd66be2828a7eeb43ea210aff8cbc2911f16196
   FFMS2_VERSION: "5.0"
+  VMAF_VERSION: v3.2.0
   RUST_VERSION: 1.96.0
 
 # Least privilege by default; the appimage job opts into contents: write to attach release assets.
@@ -38,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake nasm yasm git curl ca-certificates \
+            build-essential cmake meson ninja-build xxd nasm yasm git curl ca-certificates \
             pkg-config autoconf automake libtool \
             libavcodec-dev libavformat-dev libswscale-dev libavutil-dev libpostproc-dev \
             ffmpeg mkvtoolnix \
@@ -93,6 +94,23 @@ jobs:
           sudo make install
           sudo ldconfig
 
+      - name: Build libvmaf
+        run: |
+          git clone --depth 1 --branch "$VMAF_VERSION" \
+            https://github.com/Netflix/vmaf.git /tmp/vmaf
+          cd /tmp/vmaf/libvmaf
+          meson setup build \
+            --buildtype=release \
+            --default-library=shared \
+            -Dbuilt_in_models=true \
+            -Denable_tests=false \
+            -Denable_docs=false \
+            -Denable_float=true
+          ninja -C build
+          sudo ninja -C build install
+          sudo install -m755 build/tools/vmaf /usr/local/bin/vmaf
+          sudo ldconfig
+
       - name: Build avxs
         env:
           PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
@@ -111,8 +129,10 @@ jobs:
           cp "$(command -v ffmpeg)"           "$APPDIR/usr/bin/"
           cp "$(command -v ffprobe)"          "$APPDIR/usr/bin/"
           cp "$(command -v mkvmerge)"         "$APPDIR/usr/bin/"
+          cp /usr/local/bin/vmaf              "$APPDIR/usr/bin/"
 
           cp /usr/local/lib/libffms2.so*      "$APPDIR/usr/lib/"
+          cp /usr/local/lib/libvmaf.so*       "$APPDIR/usr/lib/"
 
       - name: Build AppImage
         run: |

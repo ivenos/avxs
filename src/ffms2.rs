@@ -352,8 +352,6 @@ impl Drop for VideoSource {
 
 #[derive(Default, Clone, Copy)]
 pub struct OpenOpts {
-    /// Lanczos-scale target dimensions; None = native resolution.
-    pub target_size: Option<(u32, u32)>,
     /// Force input bit depth (8 or 10); None = match source.
     pub target_bit_depth: Option<u8>,
 }
@@ -394,13 +392,10 @@ impl VideoSource {
         let raw_pix_fmt = unsafe { (*first_frame).encoded_pixel_format };
         let mut pixel_format = detect_pixel_format(raw_pix_fmt);
 
-        let frame_w = unsafe { (*first_frame).encoded_width };
-        let frame_h = unsafe { (*first_frame).encoded_height };
-
-        let (out_w, out_h, resizer) = match opts.target_size {
-            Some((w, h)) => (w as c_int, h as c_int, FFMS_RESIZER_LANCZOS),
-            None         => (frame_w, frame_h, FFMS_RESIZER_BICUBIC),
-        };
+        // Native resolution only; scaling happens later in the encode pipe (crop before scale).
+        let out_w = unsafe { (*first_frame).encoded_width };
+        let out_h = unsafe { (*first_frame).encoded_height };
+        let resizer = FFMS_RESIZER_BICUBIC;
 
         // Depth conversion: pick a pixfmt with the same subsampling but the requested depth.
         if let Some(depth) = opts.target_bit_depth

@@ -51,6 +51,14 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
+      "matchStrings": ["ARG VMAF_VERSION=(?<currentValue>[^\\n]+)"],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "Netflix/vmaf",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": ["ARG RUST_VERSION=(?<currentValue>[^\\n]+)"],
       "datasourceTemplate": "docker",
       "depNameTemplate": "rust",
@@ -79,6 +87,14 @@
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "FFMS/ffms2",
       "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
+      "matchStrings": ["VMAF_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "Netflix/vmaf",
+      "versioningTemplate": "semver"
     },
     {
       "customType": "regex",
