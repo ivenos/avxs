@@ -41,7 +41,7 @@ assert_audio_codec       "$O/test.mkv" 0 aac
 assert_audio_codec       "$O/test.mkv" 1 aac
 assert_audio_codec       "$O/test.mkv" 2 aac
 
-# -- codec_rule: ac3 → aac, others copied -------------------------------------
+# -- codec_rule: ac3 to aac, others copied -------------------------------------
 I="$WORKDIR/3/in"; O="$WORKDIR/3/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_multiaudio.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -123,7 +123,7 @@ assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
 
-# -- 7.1 encode → opus: aformat filter preserves 7.1 layout -------------------
+# -- 7.1 encode to opus: aformat filter preserves 7.1 layout -------------------
 I="$WORKDIR/8/in"; O="$WORKDIR/8/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_71audio.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -174,7 +174,7 @@ assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
 
-# -- lossless override: flac source → flac, no bitrate, options applied --------
+# -- lossless override: flac source to flac, no bitrate, options applied --------
 I="$WORKDIR/11/in"; O="$WORKDIR/11/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_71audio.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -194,9 +194,9 @@ run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "lossless override: no output"
 assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
-assert_audio_title       "$O/test.mkv" 0 "FLAC"   # untitled source → marker only
+assert_audio_title       "$O/test.mkv" 0 "FLAC"   # untitled source to marker only
 
-# -- lossy default + per-layout bitrate: lossy tracks → opus -------------------
+# -- lossy default + per-layout bitrate: lossy tracks to opus -------------------
 I="$WORKDIR/12/in"; O="$WORKDIR/12/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_multiaudio.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -214,9 +214,9 @@ assert_audio_track_count "$O/test.mkv" 3
 assert_audio_codec       "$O/test.mkv" 0 opus
 assert_audio_codec       "$O/test.mkv" 1 opus
 assert_audio_codec       "$O/test.mkv" 2 opus
-assert_audio_title       "$O/test.mkv" 0 "Opus"   # untitled source → marker only
+assert_audio_title       "$O/test.mkv" 0 "Opus"   # untitled source to marker only
 
-# -- codec_rules beats lossless detection; per-layout 7.1 → opus --------------
+# -- codec_rules beats lossless detection; per-layout 7.1 to opus --------------
 I="$WORKDIR/13/in"; O="$WORKDIR/13/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_71audio.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'

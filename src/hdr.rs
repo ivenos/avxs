@@ -1,8 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;
-
-use crate::paths::external_bin;
 
 #[derive(Debug, Default, Clone)]
 pub struct HdrInfo {
@@ -91,8 +89,8 @@ struct SideData {
 }
 
 pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
-    let out = tokio::process::Command::new(external_bin("ffprobe"))
-        .args([
+    let probe: ProbeOutput = match crate::ext::ffprobe_json(
+        &[
             "-v", "error",
             "-select_streams", "v:0",
             "-read_intervals", "%+#1",
@@ -100,22 +98,14 @@ pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
             "-show_frames",
             "-show_entries", "frame=side_data_list",
             "-print_format", "json",
-        ])
-        .arg(source_file)
-        .output()
-        .await
-        .context("ffprobe HDR detection")?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        tracing::warn!("ffprobe HDR detection failed: {stderr}");
-        return Ok(HdrInfo::default());
-    }
-
-    let probe: ProbeOutput = match serde_json::from_slice(&out.stdout) {
+        ],
+        source_file,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("ffprobe HDR JSON parse failed: {e:#}");
+            tracing::warn!("ffprobe HDR detection failed: {e:#}");
             return Ok(HdrInfo::default());
         }
     };
@@ -190,7 +180,7 @@ pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
     Ok(info)
 }
 
-// ffprobe name → ITU-T H.273 numeric code (same values used by SVT-AV1)
+// ffprobe name to ITU-T H.273 numeric code (same values used by SVT-AV1)
 fn map_color_primaries(s: &str) -> Option<u32> {
     Some(match s {
         "bt709"     => 1,

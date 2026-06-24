@@ -69,7 +69,7 @@ EOF
 run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "crop+scale: no output"
 assert_video_height_le "$O/test.mkv" 240
 
-# -- empty cache → "no black bars (cached)" -----------------------------------
+# -- empty cache to "no black bars (cached)" -----------------------------------
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I/p" "$O/.avxs_test"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 printf '' > "$O/.avxs_test/crop.cache"

@@ -75,9 +75,9 @@ crf    = 50
 [avxs]
 bit_depth = 10
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 8→10: no output"
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 8 to 10: no output"
 assert_video_pix_fmt "$O/test.mkv" "yuv420p10le"
-assert_log_contains  "bit-depth conversion: 8-bit → 10-bit"
+assert_log_contains  "bit-depth conversion: 8-bit to 10-bit"
 
 # -- bit_depth=8 on 10-bit source: output is 8-bit, conversion logged ---------
 I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
@@ -90,9 +90,9 @@ crf    = 50
 [avxs]
 bit_depth = 8
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 10→8: no output"
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 10 to 8: no output"
 assert_video_pix_fmt "$O/test.mkv" "yuv420p"
-assert_log_contains  "bit-depth conversion: 10-bit → 8-bit"
+assert_log_contains  "bit-depth conversion: 10-bit to 8-bit"
 
 # -- bit_depth matching source: no conversion log -----------------------------
 I="$WORKDIR/8/in"; O="$WORKDIR/8/out"; mkdir -p "$I/p" "$O"

@@ -34,7 +34,7 @@ EOF
 run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "keep_temp=true: no output"
 assert_dir_exists "$O/.avxs_test"
 
-# -- scale down: 720p → 360p ---------------------------------------------------
+# -- scale down: 720p to 360p ---------------------------------------------------
 I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_720p.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'

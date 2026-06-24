@@ -5,20 +5,35 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
 use crate::audio;
-use crate::config::{Config, VideoMode};
+use crate::config::{Config, TargetQualityConfig, VideoMode};
 use crate::encode::{self, EncodeOptions};
 use crate::ffms2::{self, Crop};
-use crate::paths::external_bin;
 use crate::resume::{CrfCache, DoneFile, SceneEntry, TempDir};
 use crate::scanner::Job;
 use crate::scene;
 use crate::target_quality;
-use crate::vmaf;
 use crate::workers;
 
 pub struct JobContext {
     pub input_dir: PathBuf,
     pub output_dir: PathBuf,
+}
+
+/// Per-job context shared by every chunk worker, cloned as one Arc per task
+/// instead of threading a dozen values through each spawn.
+struct WorkerCtx {
+    source: PathBuf,
+    index: PathBuf,
+    temp_dir: PathBuf,
+    config: Arc<Config>,
+    opts: Arc<EncodeOptions>,
+    tq: Option<TargetQualityConfig>,
+    tq_model: Option<String>,
+    crf_cache: Option<Arc<CrfCache>>,
+    threads_per_worker: usize,
+    stem: String,
+    total_chunks: usize,
+    total_frames: u64,
 }
 
 pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
@@ -67,7 +82,6 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let (fps_num, fps_den) = probe_fps(&job.source_file).await?;
     let fps = fps_num as f64 / fps_den as f64;
 
-    // Auto-HDR
     let hdr_args: Vec<String> = if config.avxs.hdr {
         let hdr = crate::hdr::detect(&job.source_file).await?;
         if hdr.hdr_type == "Dolby Vision" || hdr.hdr_type == "HDR10+" {
@@ -83,7 +97,6 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         Vec::new()
     };
 
-    // Auto-Crop
     let crop_str: Option<String> = if config.avxs.crop {
         let duration_secs = video_info.num_frames as f64 / fps;
         crate::crop::detect(&job.source_file, duration_secs, &temp.crop_cache, stem).await?
@@ -91,7 +104,6 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         None
     };
 
-    // Auto-Scale: source-space crop plus an ffmpeg scale target (crop before scale)
     let (scale_target, crop, scene_vf) = compute_output_params(
         video_info.width,
         video_info.height,
@@ -100,10 +112,9 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         stem,
     );
 
-    // Auto-Keyint: ~5s keyframe distance from source FPS
     let auto_keyint: Option<u32> = if config.avxs.keyint {
         let ki = (fps * 5.0).round().max(1.0) as u32;
-        tracing::info!("[{stem}] auto-keyint: {ki} ({fps:.3} fps → keyframe every ~5s)");
+        tracing::info!("[{stem}] auto-keyint: {ki} ({fps:.3} fps, keyframe every ~5s)");
         Some(ki)
     } else {
         None
@@ -119,7 +130,14 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         target_bit_depth: config.avxs.bit_depth,
     });
 
-    // Scene detection
+    // Effective encoder args, shared by the summary log and the cache fingerprint.
+    let merged_args = encode::merged_encoder_args(&config, &encode_opts);
+
+    // Discard cached scenes/chunks if the encode profile changed since the last run,
+    // so a resumed encode never mixes chunks from different settings.
+    let fingerprint = profile_fingerprint(&merged_args, &encode_opts, &config.scene_detection);
+    invalidate_stale_cache(&temp, &fingerprint, stem)?;
+
     let scenes: Vec<SceneEntry> = if temp.scenes_path.exists() {
         tracing::info!("[{stem}] reusing scenes.json");
         crate::resume::read_scenes(&temp.scenes_path)?
@@ -151,7 +169,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
             }
             if s.end_frame >= ffms2_frames {
                 tracing::warn!(
-                    "[{stem}] clamping scene {} end_frame {} → {}",
+                    "[{stem}] clamping scene {} end_frame {} to {}",
                     s.index, s.end_frame, ffms2_frames - 1
                 );
                 s.end_frame = ffms2_frames - 1;
@@ -163,8 +181,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let total_chunks = scenes.len();
     let total_frames: u64 = scenes.iter().map(|s| s.frame_count()).sum();
 
-    // Compact "key=value" summary of effective encoder args
-    let summary: Vec<String> = encode::merged_encoder_args(&config, &encode_opts)
+    let summary: Vec<String> = merged_args
         .chunks(2)
         .filter_map(|pair| match pair {
             [k, v] => Some(format!("{}={}", k.trim_start_matches('-'), v)),
@@ -173,7 +190,6 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         .collect();
     tracing::info!("[{stem}] encoder args: {}", summary.join(" "));
 
-    // Audio plan (logged before the encode, next to the video summary)
     let audio_plan = audio::plan(&job.source_file, &config.audio).await?;
     for line in audio_plan.summary_lines() {
         tracing::info!("[{stem}] audio {line}");
@@ -185,8 +201,8 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         .unwrap_or(video_info.height);
     let (tq_model, crf_cache): (Option<String>, Option<Arc<CrfCache>>) =
         if let Some(tq) = &config.target_quality {
-            vmaf::ensure_available().await?;
-            let model = vmaf::model_for_height(output_height).to_string();
+            target_quality::ensure_available().await?;
+            let model = target_quality::model_for_height(output_height).to_string();
             tracing::info!(
                 "[{stem}] target quality: VMAF {} (model {model}, crf {}-{}, {} probes, probe preset {})",
                 tq.vmaf, tq.min_crf, tq.max_crf, tq.probes, tq.probe_preset
@@ -201,12 +217,26 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     tracing::info!("[{stem}] encoding: {total_chunks} chunks, {num_workers} worker(s)");
 
-    // Parallel chunk encoding
     let done               = Arc::new(DoneFile::load_or_create(&temp.done_path)?);
     let semaphore          = Arc::new(Semaphore::new(num_workers));
     let completed_chunks   = Arc::new(AtomicUsize::new(0));
     let completed_frames   = Arc::new(AtomicU64::new(0));
-    let mut set            = tokio::task::JoinSet::new();
+    let mut set = tokio::task::JoinSet::new();
+
+    let wctx = Arc::new(WorkerCtx {
+        source: job.source_file.clone(),
+        index: temp.index_path.clone(),
+        temp_dir: temp.path.clone(),
+        config: Arc::clone(&config),
+        opts: Arc::clone(&encode_opts),
+        tq: config.target_quality.clone(),
+        tq_model,
+        crf_cache,
+        threads_per_worker,
+        stem: stem.to_owned(),
+        total_chunks,
+        total_frames,
+    });
 
     for scene in &scenes {
         let chunk_key  = scene.padded_index();
@@ -220,76 +250,39 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
             continue;
         }
 
+        let w                = Arc::clone(&wctx);
         let sem              = semaphore.clone();
         let done             = done.clone();
         let completed_chunks = completed_chunks.clone();
         let completed_frames = completed_frames.clone();
-        let source           = job.source_file.clone();
-        let index            = temp.index_path.clone();
-        let cfg              = Arc::clone(&config);
-        let opts             = Arc::clone(&encode_opts);
-        let stem_owned       = stem.to_owned();
-        let total_c          = total_chunks;
-        let total_f          = total_frames;
-        let tq               = config.target_quality.clone();
-        let tq_model         = tq_model.clone();
-        let crf_cache        = crf_cache.clone();
-        let temp_dir         = temp.path.clone();
-        let tpw              = threads_per_worker;
 
         set.spawn(async move {
             let _permit = sem.acquire().await.context("acquire semaphore")?;
 
             let scene_frames = scene.frame_count();
+            let crf_override = resolve_crf(&w, &chunk_key, &scene).await?;
 
-            let crf_override = match (&tq, &tq_model, &crf_cache) {
-                (Some(tq), Some(model), Some(cache)) => {
-                    if let Some(c) = cache.get(&chunk_key).await {
-                        Some(c)
-                    } else {
-                        let s2 = source.clone();
-                        let i2 = index.clone();
-                        let td = temp_dir.clone();
-                        let c2 = Arc::clone(&cfg);
-                        let o2 = Arc::clone(&opts);
-                        let tq2 = tq.clone();
-                        let m2 = model.clone();
-                        let scene2 = scene.clone();
-                        let solved = tokio::task::spawn_blocking(move || {
-                            let ctx = target_quality::ProbeContext {
-                                source: &s2, index: &i2, temp_dir: &td,
-                                config: &c2, opts: &o2, tq: &tq2, model: &m2, n_threads: tpw,
-                            };
-                            target_quality::solve_chunk_crf(&ctx, &scene2)
-                        })
-                        .await
-                        .context("spawn_blocking solve_chunk_crf")??;
-                        cache.insert(&chunk_key, solved).await?;
-                        tracing::info!("[{stem_owned}] chunk {chunk_key} target crf {solved}");
-                        Some(solved)
-                    }
-                }
-                _ => None,
-            };
-
-            let overrides    = encode::EncodeOverrides { crf: crf_override, preset: None };
-            let t0           = std::time::Instant::now();
-            let size_bytes   = tokio::task::spawn_blocking(move || {
-                encode::encode_chunk(source, index, scene, chunk_path, &cfg, &opts, overrides)
+            let overrides  = encode::EncodeOverrides { crf: crf_override, preset: None };
+            let t0         = std::time::Instant::now();
+            let source     = w.source.clone();
+            let index      = w.index.clone();
+            let config     = Arc::clone(&w.config);
+            let opts       = Arc::clone(&w.opts);
+            let size_bytes = tokio::task::spawn_blocking(move || {
+                encode::encode_chunk(source, index, scene, chunk_path, &config, &opts, overrides)
             })
             .await
             .context("spawn_blocking encode_chunk")??;
 
             let enc_fps = scene_frames as f64 / t0.elapsed().as_secs_f64();
-
             done.mark_done(&chunk_key, scene_frames, size_bytes).await?;
 
             let n_chunks = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
             let n_frames = completed_frames.fetch_add(scene_frames, Ordering::Relaxed) + scene_frames;
-            let pct      = n_frames * 100 / total_f;
+            let pct      = n_frames * 100 / w.total_frames;
             tracing::info!(
-                "[{stem_owned}] chunk {n_chunks}/{total_c} - {pct}% - {enc_fps:.1} fps - {:.1} MB",
-                size_bytes as f64 / 1_048_576.0
+                "[{}] chunk {n_chunks}/{} - {pct}% - {enc_fps:.1} fps - {:.1} MB",
+                w.stem, w.total_chunks, size_bytes as f64 / 1_048_576.0
             );
 
             anyhow::Ok(())
@@ -307,15 +300,33 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     encode::concat_chunks(&chunk_paths, &video_only, &temp.path).await?;
 
     tracing::info!("[{stem}] processing audio");
-    let audio_path = audio::process_plan(&job.source_file, &temp.path, &audio_plan).await?;
+    finalize(job, ctx, &config, &temp, &audio_plan, &video_only, true).await
+}
+
+/// Shared tail of run/run_copy: process audio, mux, validate, archive source, clean up.
+/// `mux_video` is the encoded video (run) or the untouched source (run_copy);
+/// `remove_mux_video` deletes it afterwards when it is a temp file.
+async fn finalize(
+    job: &Job,
+    ctx: &JobContext,
+    config: &Config,
+    temp: &TempDir,
+    audio_plan: &audio::AudioPlan,
+    mux_video: &Path,
+    remove_mux_video: bool,
+) -> Result<()> {
+    let stem = job.stem();
+    let audio_path = audio::process_plan(&job.source_file, &temp.path, audio_plan).await?;
 
     let subtitle_sel = crate::subtitle::select_tracks(&job.source_file, &config.subtitles).await?;
 
     let final_output = ctx.output_dir.join(format!("{stem}.mkv"));
-    tracing::info!("[{stem}] muxing → {}", final_output.display());
-    audio::mux_final(&video_only, &audio_path, &job.source_file, &final_output, &subtitle_sel).await?;
+    tracing::info!("[{stem}] muxing to {}", final_output.display());
+    audio::mux_final(mux_video, &audio_path, &job.source_file, &final_output, &subtitle_sel).await?;
 
-    let _ = std::fs::remove_file(&video_only);
+    if remove_mux_video {
+        let _ = std::fs::remove_file(mux_video);
+    }
 
     tracing::info!("[{stem}] validating output");
     encode::validate_output(&final_output).await?;
@@ -323,7 +334,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let processed_dir = crate::scanner::ensure_processed_dir(&ctx.input_dir)?;
     let dest = processed_dir.join(job.source_file.file_name().unwrap());
     std::fs::rename(&job.source_file, &dest)
-        .with_context(|| format!("move source: {} → {}", job.source_file.display(), dest.display()))?;
+        .with_context(|| format!("move source: {} to {}", job.source_file.display(), dest.display()))?;
 
     if !config.avxs.keep_temp {
         std::fs::remove_dir_all(&temp.path)
@@ -331,8 +342,41 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     }
 
     tracing::info!("[{stem}] done");
-
     Ok(())
+}
+
+/// Target-quality CRF for a chunk: cached value, else probe-and-solve (then cache it).
+/// Returns None when target quality is not active.
+async fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Option<u32>> {
+    let (Some(tq), Some(model), Some(cache)) = (&w.tq, &w.tq_model, &w.crf_cache) else {
+        return Ok(None);
+    };
+    if let Some(c) = cache.get(chunk_key).await {
+        return Ok(Some(c));
+    }
+
+    let source    = w.source.clone();
+    let index     = w.index.clone();
+    let temp_dir  = w.temp_dir.clone();
+    let config    = Arc::clone(&w.config);
+    let opts      = Arc::clone(&w.opts);
+    let tq        = tq.clone();
+    let model     = model.clone();
+    let scene     = scene.clone();
+    let n_threads = w.threads_per_worker;
+    let solved = tokio::task::spawn_blocking(move || {
+        let ctx = target_quality::ProbeContext {
+            source: &source, index: &index, temp_dir: &temp_dir,
+            config: &config, opts: &opts, tq: &tq, model: &model, n_threads,
+        };
+        target_quality::solve_chunk_crf(&ctx, &scene)
+    })
+    .await
+    .context("spawn_blocking solve_chunk_crf")??;
+
+    cache.insert(chunk_key, solved).await?;
+    tracing::info!("[{}] chunk {chunk_key} target crf {solved}", w.stem);
+    Ok(Some(solved))
 }
 
 pub fn handle_failure(_job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Error) {
@@ -359,29 +403,7 @@ async fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp
     }
 
     tracing::info!("[{stem}] copy video, processing audio");
-    let audio_path = audio::process_plan(&job.source_file, &temp.path, &audio_plan).await?;
-
-    let subtitle_sel = crate::subtitle::select_tracks(&job.source_file, &config.subtitles).await?;
-
-    let final_output = ctx.output_dir.join(format!("{stem}.mkv"));
-    tracing::info!("[{stem}] muxing → {}", final_output.display());
-    audio::mux_final(&job.source_file, &audio_path, &job.source_file, &final_output, &subtitle_sel).await?;
-
-    tracing::info!("[{stem}] validating output");
-    encode::validate_output(&final_output).await?;
-
-    let processed_dir = crate::scanner::ensure_processed_dir(&ctx.input_dir)?;
-    let dest = processed_dir.join(job.source_file.file_name().unwrap());
-    std::fs::rename(&job.source_file, &dest)
-        .with_context(|| format!("move source: {} → {}", job.source_file.display(), dest.display()))?;
-
-    if !config.avxs.keep_temp {
-        std::fs::remove_dir_all(&temp.path)
-            .with_context(|| format!("remove temp dir: {}", temp.path.display()))?;
-    }
-
-    tracing::info!("[{stem}] done");
-    Ok(())
+    finalize(job, ctx, config, temp, &audio_plan, &job.source_file, false).await
 }
 
 fn ignored_video_opts(a: &crate::config::AvxsConfig) -> Vec<&'static str> {
@@ -416,43 +438,69 @@ fn compute_output_params(
         _ => 1.0,
     };
 
-    let scene_vf = build_scene_vf(crop_str, scale_factor, eff_w, eff_h);
-
-    let scale_target = if scale_factor < 1.0 {
+    let scale_target: Option<(u32, u32)> = (scale_factor < 1.0).then(|| {
         let tw = round_down_even((eff_w as f64 * scale_factor) as u32);
         let th = round_down_even((eff_h as f64 * scale_factor) as u32);
-        tracing::info!("[{stem}] auto-scale: {eff_w}×{eff_h} → {tw}×{th} (factor {scale_factor:.4})");
-        Some((tw, th))
-    } else {
-        None
-    };
+        tracing::info!("[{stem}] auto-scale: {eff_w}x{eff_h} to {tw}x{th} (factor {scale_factor:.4})");
+        (tw, th)
+    });
+
+    let scene_vf = build_scene_vf(crop_str, scale_target);
 
     (scale_target, src_crop, scene_vf)
 }
 
 /// ffmpeg -vf filter for scene detection (source-space crop + optional scale).
-fn build_scene_vf(crop_str: Option<&str>, scale_factor: f64, eff_w: u32, eff_h: u32) -> Option<String> {
-    let has_crop  = crop_str.is_some();
-    let has_scale = scale_factor < 1.0;
-
-    match (has_crop, has_scale) {
-        (false, false) => None,
-        (true,  false) => crop_str.map(|s| s.to_owned()),
-        (false, true)  => {
-            let tw = round_down_even((eff_w as f64 * scale_factor) as u32);
-            let th = round_down_even((eff_h as f64 * scale_factor) as u32);
-            Some(format!("scale={tw}:{th}"))
-        }
-        (true,  true)  => {
-            let tw = round_down_even((eff_w as f64 * scale_factor) as u32);
-            let th = round_down_even((eff_h as f64 * scale_factor) as u32);
-            Some(format!("{},scale={tw}:{th}", crop_str.unwrap()))
-        }
+fn build_scene_vf(crop_str: Option<&str>, scale_target: Option<(u32, u32)>) -> Option<String> {
+    match (crop_str, scale_target) {
+        (None,    None)         => None,
+        (Some(c), None)         => Some(c.to_owned()),
+        (None,    Some((w, h))) => Some(format!("scale={w}:{h}")),
+        (Some(c), Some((w, h))) => Some(format!("{c},scale={w}:{h}")),
     }
 }
 
 fn round_down_even(v: u32) -> u32 {
     v & !1
+}
+
+/// Stable hash of everything that affects chunk output and scene boundaries.
+/// Used to spot a changed encode profile between resumes.
+fn profile_fingerprint(
+    merged_args: &[String],
+    opts: &EncodeOptions,
+    scene_cfg: &crate::config::SceneDetectionConfig,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let parts = [
+        merged_args.join(" "),
+        format!("{:?}", opts.scale),
+        format!("{:?}", opts.crop),
+        format!("{:?}", opts.target_bit_depth),
+        format!("{scene_cfg:?}"),
+    ];
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    parts.join("|").hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Wipes cached scenes/chunks when the profile fingerprint changed, then records the
+/// new one. The frame index and crop cache survive (they depend only on the source).
+fn invalidate_stale_cache(temp: &TempDir, fingerprint: &str, stem: &str) -> Result<()> {
+    let prev = std::fs::read_to_string(&temp.fingerprint_path).ok();
+    if prev.as_deref() == Some(fingerprint) {
+        return Ok(());
+    }
+    if prev.is_some() {
+        tracing::warn!("[{stem}] encode profile changed, discarding cached scenes and chunks");
+        let _ = std::fs::remove_file(&temp.scenes_path);
+        let _ = std::fs::remove_file(&temp.done_path);
+        let _ = std::fs::remove_file(&temp.tq_path);
+        let _ = std::fs::remove_dir_all(&temp.chunks_dir);
+        temp.create_dirs()?;
+    }
+    std::fs::write(&temp.fingerprint_path, fingerprint)
+        .with_context(|| format!("write {}", temp.fingerprint_path.display()))
 }
 
 /// Waits until file size is stable across two checks. 200ms fast-path, then 2s polling, 300s timeout.
@@ -497,22 +545,12 @@ async fn probe_fps(source: &Path) -> Result<(u32, u32)> {
     #[derive(serde::Deserialize)]
     struct Stream { avg_frame_rate: String }
 
-    let out = tokio::process::Command::new(external_bin("ffprobe"))
-        .args(["-v", "error", "-select_streams", "v:0",
-               "-show_entries", "stream=avg_frame_rate",
-               "-of", "json"])
-        .arg(source)
-        .output()
-        .await
-        .context("start ffprobe for fps detection")?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("ffprobe failed:\n{stderr}");
-    }
-
-    let p: Probe = serde_json::from_slice(&out.stdout)
-        .context("parse ffprobe fps output")?;
+    let p: Probe = crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", "v:0",
+          "-show_entries", "stream=avg_frame_rate", "-of", "json"],
+        source,
+    )
+    .await?;
     let rate = p.streams.into_iter().next()
         .map(|s| s.avg_frame_rate)
         .context("ffprobe found no video stream")?;
@@ -524,6 +562,35 @@ async fn probe_fps(source: &Path) -> Result<(u32, u32)> {
     } else {
         let n: u32 = rate.trim().parse().context("parse fps")?;
         if n > 0 { Ok((n, 1)) } else { bail!("invalid fps: {n}") }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SceneDetectionConfig;
+
+    fn opts() -> EncodeOptions {
+        EncodeOptions { fps_num: 24, fps_den: 1, ..Default::default() }
+    }
+
+    #[test]
+    fn fingerprint_changes_with_profile() {
+        let args = vec!["--crf".to_string(), "28".to_string()];
+        let sc = SceneDetectionConfig::default();
+        let base = profile_fingerprint(&args, &opts(), &sc);
+
+        // identical inputs -> identical fingerprint
+        assert_eq!(base, profile_fingerprint(&args, &opts(), &sc));
+
+        // encoder-arg change -> different
+        let args2 = vec!["--crf".to_string(), "30".to_string()];
+        assert_ne!(base, profile_fingerprint(&args2, &opts(), &sc));
+
+        // scale change -> different
+        let mut o = opts();
+        o.scale = Some((1920, 1080));
+        assert_ne!(base, profile_fingerprint(&args, &o, &sc));
     }
 }
 

@@ -6,7 +6,7 @@ use std::process::Stdio;
 
 use crate::config::{Config, Encoder};
 use crate::ffms2::{Crop, OpenOpts, VideoSource};
-use crate::paths::external_bin;
+use crate::ext::external_bin;
 use crate::resume::SceneEntry;
 
 /// Per-call CRF/preset overrides (target quality probes and final encode).
@@ -16,7 +16,7 @@ pub struct EncodeOverrides {
     pub preset: Option<u32>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct EncodeOptions {
     /// SVT-AV1 HDR args (color-primaries, transfer, etc.)
     pub hdr_args: Vec<String>,
@@ -289,35 +289,20 @@ pub async fn concat_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn params(pairs: &[(&str, i64)]) -> HashMap<String, toml::Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), toml::Value::Integer(*v))).collect()
+    }
+
+    fn cfg(encoder_params: HashMap<String, toml::Value>) -> Config {
+        Config { encoder: Some(Encoder::SvtAv1), encoder_params, ..Default::default() }
+    }
 
     #[test]
     fn build_encoder_args_includes_params() {
-        use crate::config::{AudioConfig, AvxsConfig, SceneDetectionConfig};
-        use std::collections::HashMap;
-
-        let mut params = HashMap::new();
-        params.insert("crf".to_string(), toml::Value::Integer(28));
-        params.insert("preset".to_string(), toml::Value::Integer(6));
-
-        let config = Config {
-            encoder: Some(Encoder::SvtAv1),
-            encoder_params: params,
-            avxs: AvxsConfig::default(),
-            audio: AudioConfig::default(),
-            subtitles: crate::config::SubtitleConfig::default(),
-            scene_detection: SceneDetectionConfig::default(),
-            target_quality: None,
-        };
-
-        let opts = EncodeOptions {
-            hdr_args: Vec::new(),
-            keyint: None,
-            scale: None,
-            crop: None,
-            fps_num: 24,
-            fps_den: 1,
-            target_bit_depth: None,
-        };
+        let config = cfg(params(&[("crf", 28), ("preset", 6)]));
+        let opts = EncodeOptions { fps_num: 24, fps_den: 1, ..Default::default() };
 
         let out = PathBuf::from("/tmp/chunk.ivf");
         let args = build_encoder_args(&config, &out, &opts).unwrap();
@@ -331,36 +316,13 @@ mod tests {
 
     #[test]
     fn auto_keyint_skipped_when_manual() {
-        use crate::config::{AudioConfig, AvxsConfig, SceneDetectionConfig};
-        use std::collections::HashMap;
-
-        let mut params = HashMap::new();
-        params.insert("keyint".to_string(), toml::Value::Integer(240));
-
-        let config = Config {
-            encoder: Some(Encoder::SvtAv1),
-            encoder_params: params,
-            avxs: AvxsConfig::default(),
-            audio: AudioConfig::default(),
-            subtitles: crate::config::SubtitleConfig::default(),
-            scene_detection: SceneDetectionConfig::default(),
-            target_quality: None,
-        };
-
-        let opts = EncodeOptions {
-            hdr_args: Vec::new(),
-            keyint: Some(120), // would be auto-keyint
-            scale: None,
-            crop: None,
-            fps_num: 24,
-            fps_den: 1,
-            target_bit_depth: None,
-        };
+        let config = cfg(params(&[("keyint", 240)]));
+        let opts = EncodeOptions { keyint: Some(120), fps_num: 24, fps_den: 1, ..Default::default() };
 
         let out = PathBuf::from("/tmp/chunk.ivf");
         let args = build_encoder_args(&config, &out, &opts).unwrap();
 
-        // Manual keyint=240 should be present, auto 120 should not appear
+        // Manual keyint=240 wins; auto 120 must not appear.
         let keyint_pos = args.iter().position(|a| a == "--keyint").unwrap();
         assert_eq!(args[keyint_pos + 1], "240");
         assert_eq!(args.iter().filter(|a| *a == "--keyint").count(), 1);
@@ -368,28 +330,8 @@ mod tests {
 
     #[test]
     fn auto_keyint_injected_when_not_manual() {
-        use crate::config::{AudioConfig, AvxsConfig, SceneDetectionConfig};
-        use std::collections::HashMap;
-
-        let config = Config {
-            encoder: Some(Encoder::SvtAv1),
-            encoder_params: HashMap::new(),
-            avxs: AvxsConfig::default(),
-            audio: AudioConfig::default(),
-            subtitles: crate::config::SubtitleConfig::default(),
-            scene_detection: SceneDetectionConfig::default(),
-            target_quality: None,
-        };
-
-        let opts = EncodeOptions {
-            hdr_args: Vec::new(),
-            keyint: Some(120),
-            scale: None,
-            crop: None,
-            fps_num: 24,
-            fps_den: 1,
-            target_bit_depth: None,
-        };
+        let config = cfg(HashMap::new());
+        let opts = EncodeOptions { keyint: Some(120), fps_num: 24, fps_den: 1, ..Default::default() };
 
         let out = PathBuf::from("/tmp/chunk.ivf");
         let args = build_encoder_args(&config, &out, &opts).unwrap();
@@ -400,34 +342,16 @@ mod tests {
 
     #[test]
     fn auto_hdr_skipped_when_manual_override() {
-        use crate::config::{AudioConfig, AvxsConfig, SceneDetectionConfig};
-        use std::collections::HashMap;
-
-        let mut params = HashMap::new();
         // User pinned color-primaries; auto-HDR must not override.
-        params.insert("color-primaries".to_string(), toml::Value::Integer(1));
-
-        let config = Config {
-            encoder: Some(Encoder::SvtAv1),
-            encoder_params: params,
-            avxs: AvxsConfig::default(),
-            audio: AudioConfig::default(),
-            subtitles: crate::config::SubtitleConfig::default(),
-            scene_detection: SceneDetectionConfig::default(),
-            target_quality: None,
-        };
-
+        let config = cfg(params(&[("color-primaries", 1)]));
         let opts = EncodeOptions {
             hdr_args: vec![
                 "--color-primaries".into(), "9".into(),
                 "--transfer-characteristics".into(), "16".into(),
             ],
-            keyint: None,
-            scale: None,
-            crop: None,
             fps_num: 24,
             fps_den: 1,
-            target_bit_depth: None,
+            ..Default::default()
         };
 
         let args = merged_encoder_args(&config, &opts);

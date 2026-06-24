@@ -6,7 +6,7 @@ use tokio::process::Command;
 use tokio::sync::OnceCell;
 
 use crate::config::{AudioConfig, AudioMode, layout_name, output_is_lossless, toml_value_to_arg};
-use crate::paths::external_bin;
+use crate::ext::external_bin;
 
 // Only libopus-native layouts, so aformat remaps e.g. 5.1(side) -> 5.1 without
 // dropping channels. Other codecs keep the source layout.
@@ -165,50 +165,29 @@ struct FfprobeDispOutput {
 }
 
 async fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDisposition> {
-    let Ok(out) = Command::new(external_bin("ffprobe"))
-        .args(["-v", "error", "-select_streams", stream_spec,
-               "-show_entries", "stream=disposition",
-               "-of", "json"])
-        .arg(path)
-        .output()
-        .await
-    else {
-        tracing::warn!("ffprobe disposition probe failed to start for {}", path.display());
-        return vec![];
-    };
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        tracing::warn!("ffprobe disposition probe failed for {}: {}", path.display(), stderr.trim());
-        return vec![];
-    }
-    serde_json::from_slice::<FfprobeDispOutput>(&out.stdout)
-        .map(|p| p.streams.into_iter().map(|s| s.disposition).collect())
-        .unwrap_or_else(|e| {
-            tracing::warn!("failed to parse ffprobe disposition output for {}: {e:#}", path.display());
+    match crate::ext::ffprobe_json::<FfprobeDispOutput>(
+        &["-v", "error", "-select_streams", stream_spec,
+          "-show_entries", "stream=disposition", "-of", "json"],
+        path,
+    )
+    .await
+    {
+        Ok(p) => p.streams.into_iter().map(|s| s.disposition).collect(),
+        Err(e) => {
+            tracing::warn!("ffprobe disposition probe failed for {}: {e:#}", path.display());
             vec![]
-        })
+        }
+    }
 }
 
 async fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
-    let out = Command::new(external_bin("ffprobe"))
-        .args([
-            "-v", "error",
-            "-select_streams", "a",
-            "-show_entries", "stream=codec_name,profile,channels:stream_tags=language,title",
-            "-of", "json",
-        ])
-        .arg(source_file)
-        .output()
-        .await
-        .context("ffprobe audio streams")?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("ffprobe failed:\n{stderr}");
-    }
-
-    let parsed: FfprobeOutput =
-        serde_json::from_slice(&out.stdout).context("parse ffprobe output")?;
+    let parsed: FfprobeOutput = crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", "a",
+          "-show_entries", "stream=codec_name,profile,channels:stream_tags=language,title",
+          "-of", "json"],
+        source_file,
+    )
+    .await?;
 
     Ok(parsed
         .streams
@@ -230,7 +209,7 @@ fn track_passes_whitelist(track: &AudioTrack, whitelist: &[String]) -> bool {
         return true;
     }
     match &track.language {
-        // no language tag → always keep
+        // no language tag, always keep
         None => true,
         Some(lang) => whitelist.iter().any(|w| w == lang),
     }

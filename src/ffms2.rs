@@ -7,7 +7,7 @@ use std::os::raw::{c_char, c_double, c_int, c_uint};
 use std::path::Path;
 use std::sync::Once;
 
-use crate::paths::external_bin;
+use crate::ext::external_bin;
 
 const FFMS_ERROR_BUFFER_SIZE: usize = 1024;
 const FFMS_SEEK_NORMAL: c_int = 1; // FFMS2 5.0: enum shifted, 1 = SEEK_NORMAL (supports random access)
@@ -397,14 +397,18 @@ impl VideoSource {
         let out_h = unsafe { (*first_frame).encoded_height };
         let resizer = FFMS_RESIZER_BICUBIC;
 
-        // Depth conversion: pick a pixfmt with the same subsampling but the requested depth.
-        if let Some(depth) = opts.target_bit_depth
+        // SVT-AV1 accepts only 8/10-bit input. Honor an explicit override, otherwise
+        // clamp sources deeper than 10-bit (12/16) down to 10-bit so they still encode.
+        let target_depth = opts.target_bit_depth
+            .or((pixel_format.bit_depth > 10).then_some(10u8));
+
+        if let Some(depth) = target_depth
             && depth as u32 != pixel_format.bit_depth
         {
             match pixfmt_for(pixel_format.subsampling, depth) {
                 Some(pf) => {
                     tracing::info!(
-                        "bit-depth conversion: {}-bit → {}-bit",
+                        "bit-depth conversion: {}-bit to {}-bit",
                         pixel_format.bit_depth, depth
                     );
                     pixel_format.pix_fmt = pf;

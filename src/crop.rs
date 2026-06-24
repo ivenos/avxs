@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::paths::external_bin;
+use crate::ext::external_bin;
 
 /// Detects black bars via ffmpeg cropdetect. Result is cached next to the source file.
 /// Returns the crop string in ffmpeg format: "crop=W:H:X:Y", or None if no crop needed.
@@ -80,15 +80,13 @@ async fn probe_dimensions(source_file: &Path) -> Result<(u64, u64)> {
     #[derive(serde::Deserialize)]
     struct Stream { width: u64, height: u64 }
 
-    let out = tokio::process::Command::new(external_bin("ffprobe"))
-        .args(["-v", "error", "-select_streams", "v:0",
-               "-show_entries", "stream=width,height", "-of", "json"])
-        .arg(source_file)
-        .output()
-        .await?;
-
-    let root: Root = serde_json::from_slice(&out.stdout)
-        .unwrap_or(Root { streams: vec![] });
+    let root: Root = crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", "v:0",
+          "-show_entries", "stream=width,height", "-of", "json"],
+        source_file,
+    )
+    .await
+    .unwrap_or(Root { streams: vec![] });
     Ok(root.streams.into_iter().next().map(|s| (s.width, s.height)).unwrap_or((0, 0)))
 }
 

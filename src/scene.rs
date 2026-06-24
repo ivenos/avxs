@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use crate::config::{SceneDetectionConfig, SceneDetectionSpeedConfig};
-use crate::paths::external_bin;
+use crate::ext::external_bin;
 use crate::resume::SceneEntry;
 
 pub async fn detect(

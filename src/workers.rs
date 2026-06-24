@@ -30,8 +30,8 @@ pub fn calculate(info: &VideoInfo, stem: &str, threads_per_worker: usize) -> usi
 
     tracing::info!(
         "[{stem}] workers: {workers} \
-         (cpu={cpu_cores}/{threads_per_worker} threads → {by_cpu}, \
-         ram={ram_gb:.0}GB/{ram_per_worker:.1}GB → {by_ram})"
+         (cpu={cpu_cores}/{threads_per_worker} threads allows {by_cpu}, \
+         ram={ram_gb:.0}GB/{ram_per_worker:.1}GB allows {by_ram})"
     );
 
     workers

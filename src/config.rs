@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
     pub encoder: Option<Encoder>,
     #[serde(default)]
@@ -195,30 +195,26 @@ pub enum SceneDetectionSpeedConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
 pub struct SceneDetectionConfig {
     /// Minimum number of frames between scene cuts.
-    #[serde(default = "SceneDetectionConfig::default_min_scene_len")]
     pub min_scene_len: usize,
     /// Maximum scene length in seconds before an extra split is inserted.
     /// Set to 0 to disable. Ignored when `extra_split` > 0.
-    #[serde(default = "SceneDetectionConfig::default_extra_split_sec")]
     pub extra_split_sec: u32,
     /// Maximum scene length in frames. Overrides `extra_split_sec` when > 0. Set to 0 to disable.
-    #[serde(default)]
     pub extra_split: u32,
     /// Scene detection algorithm speed.
-    #[serde(default)]
     pub speed: SceneDetectionSpeedConfig,
     /// Downscale height for scene detection only (e.g. 720). None = no extra downscale.
-    #[serde(default)]
     pub downscale_height: Option<u32>,
 }
 
 impl Default for SceneDetectionConfig {
     fn default() -> Self {
         Self {
-            min_scene_len: Self::default_min_scene_len(),
-            extra_split_sec: Self::default_extra_split_sec(),
+            min_scene_len: 24,
+            extra_split_sec: 10,
             extra_split: 0,
             speed: SceneDetectionSpeedConfig::default(),
             downscale_height: None,
@@ -227,9 +223,6 @@ impl Default for SceneDetectionConfig {
 }
 
 impl SceneDetectionConfig {
-    fn default_min_scene_len() -> usize { 24 }
-    fn default_extra_split_sec() -> u32 { 10 }
-
     /// Returns the effective max chunk size in frames, or None if extra splitting is disabled.
     pub fn effective_extra_split_frames(&self, fps: f64) -> Option<usize> {
         if self.extra_split > 0 {
@@ -244,32 +237,32 @@ impl SceneDetectionConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
 pub struct TargetQualityConfig {
-    /// VMAF score to target per chunk.
+    /// VMAF score to target per chunk. 0 is rejected by validate().
     pub vmaf: f64,
-    #[serde(default = "TargetQualityConfig::default_min_crf")]
     pub min_crf: u32,
-    #[serde(default = "TargetQualityConfig::default_max_crf")]
     pub max_crf: u32,
-    #[serde(default = "TargetQualityConfig::default_probes")]
     pub probes: u32,
-    #[serde(default = "TargetQualityConfig::default_probe_preset")]
     pub probe_preset: u32,
     /// Accept a probe that lands up to this far below the target.
-    #[serde(default = "TargetQualityConfig::default_tolerance_under")]
     pub tolerance_under: f64,
     /// Accept a probe that lands up to this far above the target.
-    #[serde(default = "TargetQualityConfig::default_tolerance_over")]
     pub tolerance_over: f64,
 }
 
-impl TargetQualityConfig {
-    fn default_min_crf() -> u32 { 18 }
-    fn default_max_crf() -> u32 { 45 }
-    fn default_probes() -> u32 { 4 }
-    fn default_probe_preset() -> u32 { 13 }
-    fn default_tolerance_under() -> f64 { 0.5 }
-    fn default_tolerance_over() -> f64 { 2.0 }
+impl Default for TargetQualityConfig {
+    fn default() -> Self {
+        Self {
+            vmaf: 0.0,
+            min_crf: 18,
+            max_crf: 45,
+            probes: 4,
+            probe_preset: 13,
+            tolerance_under: 0.5,
+            tolerance_over: 2.0,
+        }
+    }
 }
 
 impl Config {
@@ -359,12 +352,8 @@ mod tests {
     fn cfg_with_bit_depth(d: Option<u8>) -> Config {
         Config {
             encoder: Some(Encoder::SvtAv1),
-            encoder_params: HashMap::new(),
             avxs: AvxsConfig { bit_depth: d, ..Default::default() },
-            audio: AudioConfig::default(),
-            subtitles: SubtitleConfig::default(),
-            scene_detection: SceneDetectionConfig::default(),
-            target_quality: None,
+            ..Default::default()
         }
     }
 

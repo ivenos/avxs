@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 use crate::resume::TempDir;
 
@@ -23,25 +23,23 @@ impl Job {
 pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
     let mut jobs = Vec::new();
 
-    for entry in WalkDir::new(input_dir)
-        .min_depth(1)
-        .max_depth(1)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|e| e.file_name() != "processed")
-    {
-        let entry = entry.context("read directory entry")?;
-        if !entry.file_type().is_dir() {
+    let mut profile_dirs: Vec<PathBuf> = std::fs::read_dir(input_dir)
+        .with_context(|| format!("read {}", input_dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    profile_dirs.sort();
+
+    for profile_dir in profile_dirs {
+        if !profile_dir.is_dir() || profile_dir.file_name() == Some(OsStr::new("processed")) {
             continue;
         }
 
-        let profile_dir = entry.path();
         let encode_toml = profile_dir.join("encode.toml");
         if !encode_toml.exists() {
             continue;
         }
 
-        for source_file in find_video_files(profile_dir)? {
+        for source_file in find_video_files(&profile_dir)? {
             if output_exists(output_dir, &source_file) {
                 tracing::debug!(file = %source_file.display(), "skip: output exists");
                 continue;

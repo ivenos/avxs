@@ -4,13 +4,20 @@ use std::path::Path;
 use tokio::process::Command;
 
 use crate::config::{SubtitleConfig, SubtitleMode};
-use crate::paths::external_bin;
+use crate::ext::external_bin;
 
 pub enum SubtitleSelection {
     Strip,
     All,
     Indices(Vec<usize>),
 }
+
+#[derive(Deserialize)]
+struct SubProbe { streams: Vec<SubStream> }
+#[derive(Deserialize)]
+struct SubStream { #[serde(default)] tags: SubTags }
+#[derive(Deserialize, Default)]
+struct SubTags { language: Option<String> }
 
 pub async fn select_tracks(source: &Path, config: &SubtitleConfig) -> Result<SubtitleSelection> {
     if config.mode == SubtitleMode::Strip {
@@ -20,18 +27,7 @@ pub async fn select_tracks(source: &Path, config: &SubtitleConfig) -> Result<Sub
         return Ok(SubtitleSelection::All);
     }
 
-    let stdout = probe_subtitle_langs(source).await?;
-
-    #[derive(Deserialize)]
-    struct Probe { streams: Vec<Stream> }
-    #[derive(Deserialize)]
-    struct Stream { #[serde(default)] tags: Tags }
-    #[derive(Deserialize, Default)]
-    struct Tags { language: Option<String> }
-
-    let probe: Probe = serde_json::from_slice(&stdout)
-        .context("parse ffprobe subtitle output")?;
-
+    let probe = probe_subtitle_langs(source).await?;
     let indices: Vec<usize> = probe.streams.iter().enumerate()
         .filter(|(_, s)| match &s.tags.language {
             None       => true,
@@ -43,31 +39,20 @@ pub async fn select_tracks(source: &Path, config: &SubtitleConfig) -> Result<Sub
     Ok(SubtitleSelection::Indices(indices))
 }
 
-/// ffprobe subtitle languages as JSON, retried since the probe can fail transiently.
-async fn probe_subtitle_langs(source: &Path) -> Result<Vec<u8>> {
+/// ffprobe subtitle languages, retried since the probe can fail transiently.
+async fn probe_subtitle_langs(source: &Path) -> Result<SubProbe> {
+    let args = &["-v", "error", "-select_streams", "s",
+                 "-show_entries", "stream_tags=language", "-of", "json"];
     let mut last = String::new();
     for attempt in 1..=3 {
-        let out = Command::new(external_bin("ffprobe"))
-            .args([
-                "-v", "error",
-                "-select_streams", "s",
-                "-show_entries", "stream_tags=language",
-                "-of", "json",
-            ])
-            .arg(source)
-            .output()
-            .await
-            .context("ffprobe subtitle streams")?;
-
-        if out.status.success() {
-            return Ok(out.stdout);
+        match crate::ext::ffprobe_json::<SubProbe>(args, source).await {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                last = e.to_string();
+                tracing::warn!("ffprobe subtitle probe attempt {attempt}/3 failed: {last}");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
-        last = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        tracing::warn!(
-            "ffprobe subtitle probe attempt {attempt}/3 failed (exit {:?}): {last}",
-            out.status.code()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     bail!("ffprobe subtitle probe failed after 3 attempts: {last}");
 }

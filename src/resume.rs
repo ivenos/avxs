@@ -1,8 +1,28 @@
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
+
+/// Reads a JSON file, or returns the default if it does not exist.
+fn load_json_or_default<T: DeserializeOwned + Default>(path: &Path, what: &str) -> Result<T> {
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read {what}: {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse {what}: {}", path.display()))
+}
+
+/// Writes JSON via a temp file + rename so a crash never leaves a half-written file.
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(value)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SceneEntry {
@@ -52,14 +72,7 @@ pub struct DoneFile {
 
 impl DoneFile {
     pub fn load_or_create(path: &Path) -> Result<Self> {
-        let state = if path.exists() {
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("read done.json: {}", path.display()))?;
-            serde_json::from_str(&raw)
-                .with_context(|| format!("parse done.json: {}", path.display()))?
-        } else {
-            DoneState::default()
-        };
+        let state = load_json_or_default(path, "done.json")?;
         Ok(Self { path: path.to_owned(), state: Mutex::new(state) })
     }
 
@@ -75,12 +88,7 @@ impl DoneFile {
     pub async fn mark_done(&self, chunk_key: &str, frames: u64, size_bytes: u64) -> Result<()> {
         let mut state = self.state.lock().await;
         state.chunks.insert(chunk_key.to_owned(), ChunkInfo { frames, size_bytes });
-        let json = serde_json::to_string_pretty(&*state)?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("rename {} → {}", tmp.display(), self.path.display()))
+        write_json_atomic(&self.path, &*state)
     }
 }
 
@@ -92,14 +100,7 @@ pub struct CrfCache {
 
 impl CrfCache {
     pub fn load_or_create(path: &Path) -> Result<Self> {
-        let state = if path.exists() {
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("read tq.json: {}", path.display()))?;
-            serde_json::from_str(&raw)
-                .with_context(|| format!("parse tq.json: {}", path.display()))?
-        } else {
-            HashMap::new()
-        };
+        let state = load_json_or_default(path, "tq.json")?;
         Ok(Self { path: path.to_owned(), state: Mutex::new(state) })
     }
 
@@ -110,12 +111,7 @@ impl CrfCache {
     pub async fn insert(&self, chunk_key: &str, crf: u32) -> Result<()> {
         let mut state = self.state.lock().await;
         state.insert(chunk_key.to_owned(), crf);
-        let json = serde_json::to_string_pretty(&*state)?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("rename {} → {}", tmp.display(), self.path.display()))
+        write_json_atomic(&self.path, &*state)
     }
 }
 
@@ -125,6 +121,7 @@ pub struct TempDir {
     pub scenes_path: PathBuf,
     pub done_path: PathBuf,
     pub tq_path: PathBuf,
+    pub fingerprint_path: PathBuf,
     pub failed_path: PathBuf,
     pub chunks_dir: PathBuf,
     pub crop_cache: PathBuf,
@@ -133,14 +130,18 @@ pub struct TempDir {
 impl TempDir {
     pub fn for_video(output_dir: &Path, video_stem: &str) -> Self {
         let path = output_dir.join(format!(".avxs_{video_stem}"));
-        let index_path  = path.join("frame-index.ffindex");
-        let scenes_path = path.join("scenes.json");
-        let done_path   = path.join("done.json");
-        let tq_path     = path.join("tq.json");
-        let failed_path = path.join(".failed");
-        let chunks_dir  = path.join("chunks");
-        let crop_cache  = path.join("crop.cache");
-        Self { path, index_path, scenes_path, done_path, tq_path, failed_path, chunks_dir, crop_cache }
+        let index_path       = path.join("frame-index.ffindex");
+        let scenes_path      = path.join("scenes.json");
+        let done_path        = path.join("done.json");
+        let tq_path          = path.join("tq.json");
+        let fingerprint_path = path.join("profile.fingerprint");
+        let failed_path      = path.join(".failed");
+        let chunks_dir       = path.join("chunks");
+        let crop_cache       = path.join("crop.cache");
+        Self {
+            path, index_path, scenes_path, done_path, tq_path,
+            fingerprint_path, failed_path, chunks_dir, crop_cache,
+        }
     }
 
     pub fn create_dirs(&self) -> Result<()> {

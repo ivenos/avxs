@@ -2,16 +2,15 @@ mod audio;
 mod config;
 mod crop;
 mod encode;
+mod ext;
 mod ffms2;
 mod hdr;
 mod job;
-mod paths;
 mod resume;
 mod scanner;
 mod scene;
 mod subtitle;
 mod target_quality;
-mod vmaf;
 mod workers;
 
 use anyhow::{Context, Result};
