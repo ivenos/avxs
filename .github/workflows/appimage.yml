@@ -35,6 +35,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Resolve version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "AVXS_VERSION=${{ github.event.release.tag_name }}" >> "$GITHUB_ENV"
+          else
+            echo "AVXS_VERSION=dev-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+          fi
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -102,6 +110,7 @@ jobs:
           meson setup build \
             --buildtype=release \
             --default-library=shared \
+            --libdir=lib \
             -Dbuilt_in_models=true \
             -Denable_tests=false \
             -Denable_docs=false \
@@ -140,7 +149,7 @@ jobs:
           curl -fsSLO "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage"
           chmod +x "linuxdeploy-${{ matrix.arch }}.AppImage"
 
-          OUTPUT="avxs-${{ matrix.arch }}.AppImage" \
+          OUTPUT="avxs-${AVXS_VERSION}-${{ matrix.arch }}.AppImage" \
           "./linuxdeploy-${{ matrix.arch }}.AppImage" \
             --appdir AppDir \
             --desktop-file packaging/appimage/avxs.desktop \
@@ -151,20 +160,20 @@ jobs:
         run: |
           set +e
           mkdir -p /tmp/smoke && cd /tmp/smoke
-          timeout 10 "$GITHUB_WORKSPACE/avxs-${{ matrix.arch }}.AppImage" 2>&1 | tee smoke.log
+          timeout 10 "$GITHUB_WORKSPACE/avxs-${AVXS_VERSION}-${{ matrix.arch }}.AppImage" 2>&1 | tee smoke.log
           set -e
           grep -q "avxs started" smoke.log
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: avxs-${{ matrix.arch }}.AppImage
-          path: avxs-${{ matrix.arch }}.AppImage
+          name: avxs-${{ env.AVXS_VERSION }}-${{ matrix.arch }}.AppImage
+          path: avxs-${{ env.AVXS_VERSION }}-${{ matrix.arch }}.AppImage
           if-no-files-found: error
 
       - name: Attach to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v3
         with:
-          files: avxs-${{ matrix.arch }}.AppImage
+          files: avxs-${{ env.AVXS_VERSION }}-${{ matrix.arch }}.AppImage
           fail_on_unmatched_files: true

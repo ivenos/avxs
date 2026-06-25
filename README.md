@@ -1,47 +1,27 @@
 # avxs
 
-![Docker Image Size](https://img.shields.io/docker/image-size/ivenos/avxs)
-![Docker Pulls](https://img.shields.io/docker/pulls/ivenos/avxs)
+[![Docker Image Size](https://img.shields.io/docker/image-size/ivenos/avxs)](https://hub.docker.com/r/ivenos/avxs)
+[![Docker Pulls](https://img.shields.io/docker/pulls/ivenos/avxs)](https://hub.docker.com/r/ivenos/avxs)
+[![License](https://img.shields.io/badge/license-BSL_1.1-orange)](https://github.com/ivenos/avxs/blob/main/LICENSE)
+[![svt-av1](https://img.shields.io/badge/svt--av1-v4.1.0-purple)](https://gitlab.com/AOMediaCodec/SVT-AV1)
+[![svt-av1-hdr](https://img.shields.io/badge/svt--av1--hdr-cfb4e17-purple)](https://github.com/juliobbv-p/svt-av1-hdr) <!-- renovate: juliobbv-p/svt-av1-hdr@cfb4e17693ae16945a7fe288d45437243d96c12e -->
 
 **avxs** is an AV1 encoding service written in Rust, distributed as a Docker image and a self-contained Linux AppImage. Drop video files and an `encode.toml` profile into a folder; avxs picks them up, splits each file into scenes, encodes the chunks in parallel with SVT-AV1, and merges everything back into a finished MKV. It runs as a daemon: point it at an input and an output directory and it keeps watching for new work.
 
 It is built to run unattended. Encodes resume from the last finished chunk after a restart, audio and subtitles are carried over with per-track rules, and every external tool it needs is bundled, so there is nothing to install beside avxs itself.
 
-## Table of contents
-
-- [Features](#features)
-- [How it works](#how-it-works)
-- [Installation](#installation)
-  - [Docker](#docker)
-  - [AppImage](#appimage)
-  - [Directory layout](#directory-layout)
-  - [Environment variables](#environment-variables)
-- [Configuration](#configuration)
-  - [`encoder`](#encoder)
-  - [`[encoder_params]`](#encoder_params)
-  - [`[target_quality]`](#target_quality)
-  - [`[avxs]`](#avxs)
-  - [`[audio]`](#audio)
-  - [`[audio.lossless]`](#audiolossless)
-  - [`[audio.codec_rules]`](#audiocodec_rules)
-  - [`[subtitles]`](#subtitles)
-  - [`[scene_detection]`](#scene_detection)
-  - [Full example](#full-example)
-- [Supported encoders](#supported-encoders)
-- [License](#license)
-
 ## Features
 
-- **Scene-based parallel encoding** - splits each file into scenes via [av-scenechange](https://github.com/rust-av/av-scenechange) and encodes all chunks in parallel with SVT-AV1. Long scenes are split further so no single chunk holds up the queue.
-- **Resumable** - every finished chunk is recorded, so a crash or restart continues where it left off instead of starting over.
-- **Target quality (VMAF)** - instead of a fixed CRF, give avxs a target VMAF score. It probes each chunk at a few CRF values, measures VMAF against the source, and encodes at the CRF that hits the target. Ships with libvmaf and the VMAF v1 models built in; the model (1080p or 4K) is picked automatically.
-- **HDR passthrough** - auto-detects HDR10, HLG, Dolby Vision and HDR10+ and passes the color metadata (primaries, transfer, mastering display, content light) to the encoder. Dolby Vision and HDR10+ fall back to HDR10 static metadata.
-- **Auto-crop** - detects black bars with `cropdetect` and removes them before the encode (crop is applied before scaling, so edges stay clean).
-- **Auto-scale** - downscales to a target height with Lanczos while preserving aspect ratio; smaller sources are left untouched.
+- **Scene-based parallel encoding** - cuts each file into scenes with [av-scenechange](https://github.com/rust-av/av-scenechange) and encodes the chunks in parallel.
+- **Resumable** - finished chunks are recorded, so a crash or restart continues where it left off.
+- **Target quality (VMAF)** - probes each chunk at a few CRF values, measures [VMAF](https://github.com/Netflix/vmaf) against the source, and encodes at the CRF that hits the target. 1080p and 4K models are bundled and picked automatically.
+- **HDR passthrough** - detects HDR10, HLG, Dolby Vision and HDR10+ and passes the color metadata to the encoder; Dolby Vision and HDR10+ fall back to HDR10.
+- **Auto-crop** - removes black bars (ffmpeg `cropdetect`) before scaling.
+- **Auto-scale** - downscales to a target height with Lanczos, aspect ratio preserved; smaller sources are left untouched.
 - **Auto-keyint** - derives `--keyint` from the source frame rate for a ~5 s keyframe interval.
 - **Audio control** - copy or re-encode per source codec, with a language whitelist, per-layout bitrates, and automatic lossless handling.
-- **Subtitle control** - copy or strip subtitles, with a language whitelist. Chapters are always kept.
-- **Self-contained** - ffmpeg, mkvmerge, SvtAv1EncApp, ffmsindex, libffms2 and vmaf/libvmaf are all bundled.
+- **Subtitle control** - copy or strip per language whitelist; chapters are always kept.
+- **Self-contained** - bundles [ffmpeg](https://ffmpeg.org/), [mkvmerge](https://mkvtoolnix.download/), [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1), [ffms2](https://github.com/FFMS/ffms2) and [VMAF](https://github.com/Netflix/vmaf).
 
 ## How it works
 
@@ -56,11 +36,28 @@ For every video next to an `encode.toml`, avxs runs this pipeline:
 
 Intermediate state (index, scene list, finished chunks, solved CRFs) lives in a hidden `.avxs_<name>/` directory under the output folder, which is what makes encodes resumable. If the encode profile changes between runs (encoder args, crop, scale, bit depth, scene detection), the cached scene list and chunks are discarded and the file is re-encoded.
 
+## Table of contents
+
+- [Installation](#installation)
+  - [Docker](#1-docker)
+  - [AppImage](#2-appimage)
+- [Directory layout](#directory-layout)
+- [Environment variables](#environment-variables)
+- [Configuration](#configuration)
+  - [`encoder`](#encoder)
+  - [`[encoder_params]`](#encoder_params)
+  - [`[target_quality]`](#target_quality)
+  - [`[avxs]`](#avxs)
+  - [`[audio]`](#audio)
+  - [`[audio.lossless]`](#audiolossless)
+  - [`[audio.codec_rules]`](#audiocodec_rules)
+  - [`[subtitles]`](#subtitles)
+  - [`[scene_detection]`](#scene_detection)
+  - [Full example](#full-example)
+
 ## Installation
 
-avxs is shipped two ways. Both bundle every tool they need.
-
-### Docker
+### 1. Docker
 
 ```yaml
 services:
@@ -74,47 +71,33 @@ services:
     restart: unless-stopped
 ```
 
-The official image presets `AVXS_INPUT_DIR=/input` and `AVXS_OUTPUT_DIR=/output`, which is why the example mounts to those paths. `restart: unless-stopped` is recommended: combined with resume, the daemon recovers cleanly from any interruption.
+### 2. AppImage
 
-### AppImage
+Grab the AppImage for your architecture from the [latest release](https://github.com/ivenos/avxs/releases/latest). By default avxs creates `./input/` and `./output/` next to its working directory and watches them. Override with the [environment variables](#environment-variables) below.
 
-Linux x86_64 and aarch64. Grab the latest build for your architecture from the [releases page](https://github.com/ivenos/avxs/releases/latest), or:
-
-```sh
-ARCH=$(uname -m)
-wget "https://github.com/ivenos/avxs/releases/latest/download/avxs-${ARCH}.AppImage"
-chmod +x "avxs-${ARCH}.AppImage"
-./avxs-${ARCH}.AppImage
-```
-
-By default avxs creates `./input/` and `./output/` next to its working directory and watches them. Override with the [environment variables](#environment-variables) below, for example:
-
-```sh
-AVXS_INPUT_DIR=/media/in AVXS_OUTPUT_DIR=/media/out RUST_LOG=debug ./avxs-x86_64.AppImage
-```
-
-### Directory layout
+## Directory layout
 
 Inside the input directory, each subfolder is a profile: it holds one `encode.toml` and the video files it applies to.
 
 ```
 input/
-  movies/
-    encode.toml          # profile for everything in this folder
-    The Movie (2021).mkv
-    Another Film.mkv
-  anime/
-    encode.toml          # a different profile
-    Episode 01.mkv
+├── movies/
+│   ├── encode.toml          # profile for everything in this folder
+│   ├── The Movie (2021).mkv
+│   └── Another Film.mkv
+├── anime/
+│   ├── encode.toml          # a different profile
+│   └── Episode 01.mkv
+└── processed/               # sources are moved here after a successful encode
+
 output/
-  The Movie (2021).mkv   # finished encodes land here, flat
-  Another Film.mkv
-input/processed/         # sources are moved here after a successful encode
+├── The Movie (2021).mkv     # finished encodes land here, flat
+└── Another Film.mkv
 ```
 
 Supported input extensions: `mkv`, `mp4`, `mov`, `avi`, `ts`, `m2ts`, `flv`, `webm`, `m4v`. A file is skipped while it is still being written, and again once its output exists. If an encode fails permanently, a marker is written and the file is skipped until you remove it (the log explains how).
 
-### Environment variables
+## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -125,13 +108,7 @@ Supported input extensions: `mkv`, `mp4`, `mov`, `avi`, `ts`, `m2ts`, `flv`, `we
 
 ## Configuration
 
-Each profile folder contains an `encode.toml`. The only required key is `encoder` (unless you copy the video stream). Everything else has sensible defaults, so a minimal profile is one line:
-
-```toml
-encoder = "svt-av1"
-```
-
-The sections below document every key. A complete profile is shown in [Full example](#full-example).
+Each profile folder contains an `encode.toml`. The only required key is `encoder` (unless you copy the video stream). Everything else has sensible defaults. The sections below document every key. A complete profile is shown in [Full example](#full-example).
 
 ### `encoder`
 
@@ -141,8 +118,8 @@ encoder = "svt-av1"
 
 | Value | Description |
 |---|---|
-| `svt-av1` | SVT-AV1 |
-| `svt-av1-hdr` | SVT-AV1-HDR ([juliobbv-p](https://github.com/juliobbv-p/svt-av1-hdr) fork) |
+| `svt-av1` | [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) |
+| `svt-av1-hdr` | [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr) |
 
 Required unless `avxs.video = "copy"`, in which case the video stream is passed through and no encoder is needed.
 
@@ -243,17 +220,17 @@ Lossless codecs (`flac`, `alac`, `wavpack`, `pcm_*`) ignore bitrate, so it may b
 
 ```toml
 [audio]
-language_whitelist = ["deu", "ger"]  # German only
+language_whitelist = ["eng"]  # English only
 mode = "copy"
 ```
 
-Common ISO 639-2 codes: `deu`/`ger` (German), `eng` (English), `fra`/`fre` (French), `jpn` (Japanese), `und` (undefined).
+Common ISO 639-2 codes: `eng` (English), `deu`/`ger` (German), `fra`/`fre` (French), `jpn` (Japanese), `und` (undefined).
 
-**Track titles.** Re-encoded tracks keep their source name with the new codec appended, e.g. `Deutsch Dolby Digital Plus 7.1` becomes `Deutsch Dolby Digital Plus 7.1 (Opus)`. Untitled tracks get the codec name alone; copied tracks keep their name. Before encoding, avxs logs one line per kept track:
+**Track titles.** Re-encoded tracks keep their source name with the new codec appended, e.g. `English Dolby Digital Plus 7.1` becomes `English Dolby Digital Plus 7.1 (Opus)`. Untitled tracks get the codec name alone; copied tracks keep their name. Before encoding, avxs logs one line per kept track:
 
 ```
-audio track 0: deu eac3 5.1 (lossy) -> Opus 320k
-audio track 1: ger truehd 7.1 (lossless) -> FLAC
+audio track 0: eng eac3 5.1 (lossy) -> Opus 320k
+audio track 1: eng truehd 7.1 (lossless) -> FLAC
 ```
 
 ### `[audio.lossless]`
@@ -281,7 +258,7 @@ Per source codec override, keyed by the codec name as reported by ffprobe (lower
 
 ```toml
 [audio]
-language_whitelist = ["deu", "ger"]
+language_whitelist = ["eng"]
 mode = "copy"   # default: copy all codecs not matched by a rule
 
 [audio.codec_rules]
@@ -305,7 +282,7 @@ Controls how subtitle tracks are carried over. By default all subtitles are copi
 ```toml
 [subtitles]
 mode               = "copy"
-language_whitelist = ["deu", "eng"]  # German and English only
+language_whitelist = ["eng", "jpn"]  # English and Japanese only
 ```
 
 | Key | Type | Default | Description |
@@ -362,7 +339,7 @@ bit_depth = 10
 keep_temp = false
 
 [audio]
-language_whitelist = ["deu", "ger"]
+language_whitelist = ["eng"]
 mode    = "encode"
 codec   = "libopus"
 bitrate = { stereo = "192k", "5.1" = "320k", "7.1" = "512k", default = "192k" }
@@ -375,20 +352,9 @@ options = { compression_level = 12 }
 opus = { mode = "copy" }   # don't re-encode existing Opus
 
 [subtitles]
-language_whitelist = ["deu", "eng"]
+language_whitelist = ["eng", "jpn"]
 
 [scene_detection]
 min_scene_len   = 24
 extra_split_sec = 10
 ```
-
-## Supported encoders
-
-| `encoder` value | Binary | Version |
-|---|---|---|
-| `svt-av1` | `SvtAv1EncApp` | [v4.1.0](https://gitlab.com/AOMediaCodec/SVT-AV1) |
-| `svt-av1-hdr` | `SvtAv1EncApp-hdr` | [cfb4e17](https://github.com/juliobbv-p/svt-av1-hdr/commit/cfb4e17693ae16945a7fe288d45437243d96c12e) (main) |
-
-## License
-
-[BSL 1.1](LICENSE) - free for personal and non-commercial use.
