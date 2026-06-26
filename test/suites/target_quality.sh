@@ -13,10 +13,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 [target_quality]
-vmaf    = 95
-min_crf = 20
-max_crf = 50
-probes  = 3
+vmaf       = 95
+min_crf    = 20
+max_crf    = 50
+max_probes = 3
 [avxs]
 keep_temp = true
 EOF
@@ -34,10 +34,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 [target_quality]
-vmaf    = 90
-min_crf = 20
-max_crf = 50
-probes  = 2
+vmaf       = 90
+min_crf    = 20
+max_crf    = 50
+max_probes = 2
 [avxs]
 scale = 480
 EOF

@@ -95,7 +95,7 @@ impl DoneFile {
 /// Per-chunk solved CRF cache for target quality, so a resume skips re-probing.
 pub struct CrfCache {
     pub path: PathBuf,
-    state: Mutex<HashMap<String, u32>>,
+    state: Mutex<HashMap<String, f64>>,
 }
 
 impl CrfCache {
@@ -104,11 +104,11 @@ impl CrfCache {
         Ok(Self { path: path.to_owned(), state: Mutex::new(state) })
     }
 
-    pub async fn get(&self, chunk_key: &str) -> Option<u32> {
+    pub async fn get(&self, chunk_key: &str) -> Option<f64> {
         self.state.lock().await.get(chunk_key).copied()
     }
 
-    pub async fn insert(&self, chunk_key: &str, crf: u32) -> Result<()> {
+    pub async fn insert(&self, chunk_key: &str, crf: f64) -> Result<()> {
         let mut state = self.state.lock().await;
         state.insert(chunk_key.to_owned(), crf);
         write_json_atomic(&self.path, &*state)

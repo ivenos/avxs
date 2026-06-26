@@ -14,6 +14,9 @@ use crate::resume::SceneEntry;
 const MODEL_1080: &str = "vmaf_v1.0.16_3d0h";
 const MODEL_2160: &str = "vmaf_v1.0.16_1d5h_2160";
 
+// CRF granularity of the SVT-AV1 encoders (and the HDR fork): quarter steps.
+const CRF_STEP: f64 = 0.25;
+
 /// VMAF v1 model for the output height.
 pub fn model_for_height(output_height: u32) -> &'static str {
     if output_height >= 1440 { MODEL_2160 } else { MODEL_1080 }
@@ -42,51 +45,92 @@ pub struct ProbeContext<'a> {
     pub tq: &'a TargetQualityConfig,
     pub model: &'a str,
     pub n_threads: usize,
+    pub stem: &'a str,
+    /// Cumulative source byte sizes by frame (len = frames + 1); empty disables the cap.
+    pub source_byte_index: &'a [u64],
 }
 
-/// Probes a chunk at several CRFs and returns the one that best hits the VMAF target.
-pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<u32> {
-    let lo = ctx.tq.min_crf;
-    let hi = ctx.tq.max_crf;
+#[derive(Clone, Copy)]
+struct Probe {
+    crf: f64,
+    vmaf: f64,
+    size_pct: f64,
+}
+
+/// Why the search settled on its CRF, for logging.
+pub enum SolveOutcome {
+    /// Highest CRF that holds the VMAF floor within the size cap.
+    Met,
+    /// Size cap forced a higher CRF than the floor allowed; VMAF is below target.
+    CapBinding,
+    /// Floor unreachable in the CRF range; best-quality probe used.
+    FloorUnreachable,
+}
+
+pub struct SolveResult {
+    pub crf: f64,
+    pub vmaf: f64,
+    pub size_pct: f64,
+    pub outcome: SolveOutcome,
+}
+
+/// Finds the highest CRF whose VMAF holds the floor `tq.vmaf` and whose size
+/// stays under `tq.max_encoded_percent`. VMAF falls monotonically as CRF rises,
+/// so this is a threshold search: interpolated binary search on a 0.25 grid.
+pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveResult> {
+    let lo = ctx.tq.min_crf as f64;
+    let hi = ctx.tq.max_crf as f64;
     let target = ctx.tq.vmaf;
+    let tol = ctx.tq.tolerance;
+    let cap = ctx.tq.max_encoded_percent;
+    let key = scene.padded_index();
 
-    let mut points: Vec<(u32, f64)> = Vec::new();
-    let mut crf = seed_crf(ctx.config, lo, hi);
+    let mut pts: Vec<Probe> = Vec::new();
+    let mut crf = round_to_step(seed_crf(ctx.config, lo, hi), lo, hi);
 
-    for _ in 0..ctx.tq.probes {
-        let v = probe_once(ctx, scene, crf)?;
-        tracing::debug!("chunk {} probe crf {crf} gives vmaf {v:.2}", scene.padded_index());
-        points.push((crf, v));
-        if v >= target - ctx.tq.tolerance_under && v <= target + ctx.tq.tolerance_over {
-            return Ok(crf);
-        }
-        let next = interpolate(&points, target, lo, hi);
-        if next == crf {
+    for i in 0..ctx.tq.max_probes {
+        let (vmaf, size_pct) = probe_once(ctx, scene, crf)?;
+        tracing::info!(
+            "[{}] chunk {key} probe {}/{} crf {crf} gives VMAF {vmaf:.2}, {size_pct:.0}% size",
+            ctx.stem, i + 1, ctx.tq.max_probes
+        );
+        pts.push(Probe { crf, vmaf, size_pct });
+
+        // early stop: just above the floor, within the size cap, after min_probes
+        if i + 1 >= ctx.tq.min_probes
+            && vmaf >= target && vmaf <= target + tol && size_pct <= cap
+        {
             break;
         }
-        crf = next;
+        match next_crf(&pts, target, lo, hi) {
+            Some(next) if (next - crf).abs() > 1e-9 => crf = next,
+            _ => break,
+        }
     }
-    Ok(pick_best(&points, target, ctx.tq.tolerance_under, lo))
+
+    Ok(decide(&pts, target, cap, lo))
 }
 
-fn seed_crf(config: &Config, lo: u32, hi: u32) -> u32 {
+fn seed_crf(config: &Config, lo: f64, hi: f64) -> f64 {
     config
         .encoder_params
         .get("crf")
         .and_then(|v| match v {
-            toml::Value::Integer(i) => u32::try_from(*i).ok(),
-            toml::Value::Float(f)   => Some(*f as u32),
+            toml::Value::Integer(i) => Some(*i as f64),
+            toml::Value::Float(f)   => Some(*f),
             toml::Value::String(s)  => s.parse().ok(),
             _ => None,
         })
-        .unwrap_or((lo + hi) / 2)
+        .unwrap_or((lo + hi) / 2.0)
         .clamp(lo, hi)
 }
 
-fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: u32) -> Result<f64> {
+/// Encodes the chunk at `crf` (probe preset), measures VMAF, and reports the
+/// encoded size relative to the source over the chunk's duration.
+fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<(f64, f64)> {
     let tag = format!("{}_{crf}", scene.padded_index());
     let probe = ctx.temp_dir.join(format!("probe_{tag}.ivf"));
-    encode::encode_chunk(
+    let size_bytes = encode::encode_chunk(
         ctx.source.to_path_buf(),
         ctx.index.to_path_buf(),
         scene.clone(),
@@ -114,55 +158,114 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: u32) -> Result<f64> {
         tag: &tag,
     });
     let _ = std::fs::remove_file(&probe);
-    result
+    let vmaf = result?;
+    let size_pct = chunk_size_pct(size_bytes, ctx.source_byte_index, scene.start_frame, scene.end_frame);
+    Ok((vmaf, size_pct))
 }
 
-/// Predict the CRF that hits `target`. VMAF falls as CRF rises, so we interpolate
-/// on the two points bracketing the target (or the two nearest), then clamp/round.
-fn interpolate(points: &[(u32, f64)], target: f64, lo: u32, hi: u32) -> u32 {
-    if points.len() == 1 {
-        let (c, v) = points[0];
+/// Encoded size as a percent of the source's actual bytes for this chunk's frames.
+/// Returns 0 when the source index is unavailable, so the cap simply never binds.
+fn chunk_size_pct(encoded: u64, cum: &[u64], start: u64, end: u64) -> f64 {
+    match (cum.get(start as usize), cum.get(end as usize + 1)) {
+        (Some(lo), Some(hi)) if hi > lo => encoded as f64 / (hi - lo) as f64 * 100.0,
+        _ => 0.0,
+    }
+}
+
+/// Picks the next CRF to probe, or None when the crossing is bracketed to one
+/// 0.25 step, a bound is reached, or no new grid point remains.
+fn next_crf(pts: &[Probe], target: f64, lo: f64, hi: f64) -> Option<f64> {
+    let pass: Vec<f64> = pts.iter().filter(|p| p.vmaf >= target).map(|p| p.crf).collect();
+    let fail: Vec<f64> = pts.iter().filter(|p| p.vmaf <  target).map(|p| p.crf).collect();
+
+    if !pass.is_empty() && !fail.is_empty() {
+        let p = pass.iter().copied().fold(f64::MIN, f64::max); // highest CRF still passing
+        let f = fail.iter().copied().fold(f64::MAX, f64::min); // lowest CRF failing
+        if f - p <= CRF_STEP + 1e-9 {
+            return None; // bracketed to adjacent grid steps
+        }
+        let mut cand = round_to_step(interpolate_crf(pts, target), p, f);
+        if cand <= p + 1e-9 || cand >= f - 1e-9 || already(pts, cand) {
+            cand = round_to_step((p + f) / 2.0, p, f); // bisection fallback
+        }
+        if cand <= p + 1e-9 || cand >= f - 1e-9 || already(pts, cand) {
+            return None;
+        }
+        Some(cand)
+    } else if !pass.is_empty() {
+        // everything passes: compress harder (toward max_crf)
+        let hp = pass.iter().copied().fold(f64::MIN, f64::max);
+        if hp >= hi - 1e-9 {
+            return None;
+        }
+        let cand = round_to_step(interpolate_crf(pts, target).max(hp + CRF_STEP), hp + CRF_STEP, hi);
+        if already(pts, cand) { None } else { Some(cand) }
+    } else {
+        // everything fails: raise quality (toward min_crf)
+        let lf = fail.iter().copied().fold(f64::MAX, f64::min);
+        if lf <= lo + 1e-9 {
+            return None;
+        }
+        let cand = round_to_step(interpolate_crf(pts, target).min(lf - CRF_STEP), lo, lf - CRF_STEP);
+        if already(pts, cand) { None } else { Some(cand) }
+    }
+}
+
+/// Linear (secant) estimate of the CRF that yields `target` VMAF.
+fn interpolate_crf(pts: &[Probe], target: f64) -> f64 {
+    if pts.len() == 1 {
         // nominal slope of ~0.4 VMAF per CRF step
-        let delta = (v - target) / 0.4;
-        return clamp_round(c as f64 + delta, lo, hi);
+        return pts[0].crf + (pts[0].vmaf - target) / 0.4;
     }
-    let ((c1, v1), (c2, v2)) = bracket(points, target);
-    if (v1 - v2).abs() < 1e-6 {
-        return clamp_round((c1 + c2) as f64 / 2.0, lo, hi);
+    let (a, b) = bracket_pts(pts, target);
+    if (a.1 - b.1).abs() < 1e-6 {
+        return (a.0 + b.0) / 2.0;
     }
-    let slope = (c2 as f64 - c1 as f64) / (v2 - v1);
-    clamp_round(c1 as f64 + slope * (target - v1), lo, hi)
+    let slope = (b.0 - a.0) / (b.1 - a.1);
+    a.0 + slope * (target - a.1)
 }
 
-/// Two points to interpolate between: prefer one at/above and one below the
-/// target; otherwise the two closest to it in VMAF.
-fn bracket(points: &[(u32, f64)], target: f64) -> ((u32, f64), (u32, f64)) {
-    let above = points.iter().filter(|(_, v)| *v >= target).min_by(|x, y| x.1.total_cmp(&y.1));
-    let below = points.iter().filter(|(_, v)| *v < target).max_by(|x, y| x.1.total_cmp(&y.1));
-    if let (Some(&a), Some(&b)) = (above, below) {
-        return (a, b);
+/// Two (crf, vmaf) points to interpolate between: one at/above and one below the
+/// target if possible, otherwise the two closest in VMAF.
+fn bracket_pts(pts: &[Probe], target: f64) -> ((f64, f64), (f64, f64)) {
+    let above = pts.iter().filter(|p| p.vmaf >= target).min_by(|x, y| x.vmaf.total_cmp(&y.vmaf));
+    let below = pts.iter().filter(|p| p.vmaf <  target).max_by(|x, y| x.vmaf.total_cmp(&y.vmaf));
+    if let (Some(a), Some(b)) = (above, below) {
+        return ((a.crf, a.vmaf), (b.crf, b.vmaf));
     }
-    let mut sorted = points.to_vec();
-    sorted.sort_by(|x, y| (x.1 - target).abs().total_cmp(&(y.1 - target).abs()));
-    (sorted[0], sorted[1])
+    let mut sorted: Vec<&Probe> = pts.iter().collect();
+    sorted.sort_by(|x, y| (x.vmaf - target).abs().total_cmp(&(y.vmaf - target).abs()));
+    ((sorted[0].crf, sorted[0].vmaf), (sorted[1].crf, sorted[1].vmaf))
 }
 
-/// Final pick: the most efficient CRF (highest) whose VMAF stays at or above the
-/// lower tolerance; if none qualify, the highest-VMAF probe.
-fn pick_best(points: &[(u32, f64)], target: f64, tol_under: f64, lo: u32) -> u32 {
-    let floor = target - tol_under;
-    if let Some(&(c, _)) = points.iter().filter(|(_, v)| *v >= floor).max_by_key(|(c, _)| *c) {
-        return c;
-    }
-    points
-        .iter()
-        .max_by(|x, y| x.1.total_cmp(&y.1))
-        .map(|&(c, _)| c)
-        .unwrap_or(lo)
+fn round_to_step(v: f64, lo: f64, hi: f64) -> f64 {
+    ((v / CRF_STEP).round() * CRF_STEP).clamp(lo, hi)
 }
 
-fn clamp_round(v: f64, lo: u32, hi: u32) -> u32 {
-    (v.round() as i64).clamp(lo as i64, hi as i64) as u32
+fn already(pts: &[Probe], crf: f64) -> bool {
+    pts.iter().any(|p| (p.crf - crf).abs() < 1e-9)
+}
+
+/// Final CRF over the gathered probes. Quality floor sets an upper CRF bound, the
+/// size cap a lower one; we take the highest CRF in the overlap. If the cap forces
+/// a higher CRF than the floor allows, the cap wins. If nothing holds the floor,
+/// the best-quality probe is used.
+fn decide(pts: &[Probe], target: f64, cap: f64, lo: f64) -> SolveResult {
+    let floor = pts.iter().filter(|p| p.vmaf >= target)
+        .max_by(|a, b| a.crf.total_cmp(&b.crf)).copied();
+    let under_cap = pts.iter().filter(|p| p.size_pct <= cap)
+        .min_by(|a, b| a.crf.total_cmp(&b.crf)).copied();
+
+    let res = |p: Probe, outcome| SolveResult { crf: p.crf, vmaf: p.vmaf, size_pct: p.size_pct, outcome };
+
+    match (floor, under_cap) {
+        (Some(fl), Some(sz)) if sz.crf > fl.crf + 1e-9 => res(sz, SolveOutcome::CapBinding),
+        (Some(fl), _) => res(fl, SolveOutcome::Met),
+        (None, _) => pts.iter()
+            .max_by(|a, b| a.vmaf.total_cmp(&b.vmaf))
+            .map(|&p| res(p, SolveOutcome::FloorUnreachable))
+            .unwrap_or(SolveResult { crf: lo, vmaf: f64::NAN, size_pct: f64::NAN, outcome: SolveOutcome::FloorUnreachable }),
+    }
 }
 
 struct MeasureOpts<'a> {
@@ -307,6 +410,10 @@ fn make_fifo(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn p(crf: f64, vmaf: f64, size_pct: f64) -> Probe {
+        Probe { crf, vmaf, size_pct }
+    }
+
     #[test]
     fn model_picked_by_height() {
         assert_eq!(model_for_height(720), MODEL_1080);
@@ -317,31 +424,57 @@ mod tests {
     }
 
     #[test]
-    fn interpolate_brackets_target() {
-        // vmaf 97 @ crf30, vmaf 93 @ crf40, target 95 gives crf35
-        let pts = vec![(30u32, 97.0), (40u32, 93.0)];
-        assert_eq!(interpolate(&pts, 95.0, 10, 60), 35);
+    fn round_to_step_quarters_and_clamps() {
+        assert_eq!(round_to_step(28.1, 14.0, 45.0), 28.0);
+        assert_eq!(round_to_step(28.2, 14.0, 45.0), 28.25);
+        assert_eq!(round_to_step(28.4, 14.0, 45.0), 28.5);
+        assert_eq!(round_to_step(10.0, 14.0, 45.0), 14.0);
+        assert_eq!(round_to_step(99.0, 14.0, 45.0), 45.0);
     }
 
     #[test]
-    fn interpolate_clamps_to_bounds() {
-        let pts = vec![(30u32, 99.5), (32u32, 99.0)];
-        // target far below measured range pushes toward hi, clamped
-        assert_eq!(interpolate(&pts, 80.0, 18, 45), 45);
+    fn chunk_size_pct_uses_actual_source_bytes() {
+        // cumulative bytes by frame: frames 0..=2 are 100+200+300 = 600 source bytes
+        let cum = [0u64, 100, 300, 600, 1000];
+        assert_eq!(chunk_size_pct(300, &cum, 0, 2), 50.0);
+        assert_eq!(chunk_size_pct(200, &cum, 3, 3), 50.0);
+        // out of range or empty index disables the cap (returns 0)
+        assert_eq!(chunk_size_pct(300, &cum, 0, 99), 0.0);
+        assert_eq!(chunk_size_pct(300, &[], 0, 2), 0.0);
     }
 
     #[test]
-    fn pick_best_prefers_highest_crf_above_floor() {
-        // target 95, tol_under 0.5 gives floor 94.5; crf32@95.2 and crf36@94.6 both ok, pick 36
-        let pts = vec![(30u32, 96.0), (32u32, 95.2), (36u32, 94.6), (40u32, 92.0)];
-        assert_eq!(pick_best(&pts, 95.0, 0.5, 18), 36);
+    fn interpolate_hits_crossing() {
+        // vmaf 97 @ crf30, 93 @ crf40, target 95 -> 35
+        let pts = vec![p(30.0, 97.0, 0.0), p(40.0, 93.0, 0.0)];
+        assert!((interpolate_crf(&pts, 95.0) - 35.0).abs() < 1e-6);
     }
 
     #[test]
-    fn pick_best_falls_back_to_best_quality() {
-        // all below floor, highest vmaf wins (crf 30)
-        let pts = vec![(30u32, 90.0), (35u32, 88.0), (40u32, 85.0)];
-        assert_eq!(pick_best(&pts, 95.0, 0.5, 18), 30);
+    fn decide_picks_highest_crf_above_floor() {
+        // target 95, all under cap: highest CRF with vmaf >= 95 is 36
+        let pts = vec![p(30.0, 96.0, 50.0), p(32.0, 95.2, 45.0), p(36.0, 95.0, 40.0), p(40.0, 92.0, 35.0)];
+        let r = decide(&pts, 95.0, 90.0, 14.0);
+        assert_eq!(r.crf, 36.0);
+        assert!(matches!(r.outcome, SolveOutcome::Met));
+    }
+
+    #[test]
+    fn decide_cap_binds_over_floor() {
+        // floor CRF (20) is over the size cap; a higher CRF (25) is under it -> cap wins
+        let pts = vec![p(20.0, 96.0, 120.0), p(25.0, 93.0, 80.0)];
+        let r = decide(&pts, 95.0, 90.0, 14.0);
+        assert_eq!(r.crf, 25.0);
+        assert!(matches!(r.outcome, SolveOutcome::CapBinding));
+    }
+
+    #[test]
+    fn decide_floor_unreachable_uses_best_quality() {
+        // all below floor -> highest vmaf (crf 30)
+        let pts = vec![p(30.0, 90.0, 50.0), p(35.0, 88.0, 40.0), p(40.0, 85.0, 30.0)];
+        let r = decide(&pts, 95.0, 90.0, 14.0);
+        assert_eq!(r.crf, 30.0);
+        assert!(matches!(r.outcome, SolveOutcome::FloorUnreachable));
     }
 
     #[test]
@@ -351,12 +484,12 @@ mod tests {
             ..Default::default()
         };
         config.encoder_params.insert("crf".into(), toml::Value::Integer(28));
-        assert_eq!(seed_crf(&config, 18, 45), 28);
+        assert_eq!(seed_crf(&config, 14.0, 45.0), 28.0);
         // out of range clamps
         config.encoder_params.insert("crf".into(), toml::Value::Integer(60));
-        assert_eq!(seed_crf(&config, 18, 45), 45);
+        assert_eq!(seed_crf(&config, 14.0, 45.0), 45.0);
         // absent gives midpoint
         config.encoder_params.clear();
-        assert_eq!(seed_crf(&config, 18, 44), 31);
+        assert_eq!(seed_crf(&config, 18.0, 44.0), 31.0);
     }
 }

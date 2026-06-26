@@ -137,7 +137,7 @@ Values may be strings, integers, floats, or booleans (booleans become `1`/`0`).
 
 ### `[target_quality]`
 
-Targets a VMAF score per chunk instead of a fixed `crf`. avxs probes each chunk at a few CRF values, measures VMAF against the source, and encodes at the CRF that hits the target. Requires `avxs.video = "encode"`.
+Targets a VMAF score per chunk instead of a fixed `crf`. `vmaf` is a hard minimum: avxs probes each chunk at several CRF values, measures VMAF against the source, and picks the highest CRF (lowest bitrate) whose VMAF still holds that floor. Requires `avxs.video = "encode"`.
 
 ```toml
 [target_quality]
@@ -146,17 +146,20 @@ vmaf = 95
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `vmaf` | Float | - | Target VMAF score (required) |
-| `min_crf` | Integer | `18` | Lower bound of the CRF search |
-| `max_crf` | Integer | `45` | Upper bound of the CRF search |
-| `probes` | Integer | `4` | Maximum probe encodes per chunk |
+| `vmaf` | Float | - | Minimum VMAF score to hold per chunk (required) |
+| `min_crf` | Integer | `14` | Lower bound of the CRF search |
+| `max_crf` | Integer | `45` | Upper bound of the CRF search (max `70`) |
+| `min_probes` | Integer | `2` | Minimum probe encodes per chunk |
+| `max_probes` | Integer | `7` | Maximum probe encodes per chunk |
+| `tolerance` | Float | `0.5` | Stop early when a probe lands at most this far above the floor |
 | `probe_preset` | Integer | `13` | SVT-AV1 preset for probe encodes (`13` = fastest) |
-| `tolerance_under` | Float | `0.5` | Accept a probe up to this far below the target |
-| `tolerance_over` | Float | `2.0` | Accept a probe up to this far above the target |
+| `max_encoded_percent` | Float | `90` | Chunk size ceiling as a percent of the source's bytes for that chunk |
+
+The search is an interpolated binary search on the encoder's 0.25 CRF grid: it interpolates between probes to estimate where VMAF crosses the floor, then settles on the highest CRF that still holds it. It stops once a probe lands within `tolerance` above the floor, the crossing is narrowed to one 0.25 step, the probe budget is reached, or a CRF bound is hit. Probe encodes use `probe_preset`; the final encode uses the preset from `[encoder_params]`, so the final VMAF tends to land above the probed value.
+
+`max_encoded_percent` caps the bitrate: if holding the VMAF floor would make a chunk larger than this percent of the source's own bytes for that chunk, a higher CRF is used instead and that chunk's VMAF drops below the floor (logged as a warning). The source chunk size comes from one ffprobe pass over the video packets (no decoding). If the floor cannot be reached within `[min_crf, max_crf]`, `min_crf` is used (logged as a warning).
 
 The VMAF model is selected automatically from the output height: the VMAF v1 1080p model (`vmaf_v1.0.16_3d0h`) below 1440p, the VMAF v1 4K model (`vmaf_v1.0.16_1d5h_2160`) at 1440p and above. libvmaf and both models are bundled, so no setup is needed. VMAF is measured at 10-bit against the source after the same crop and scale as the encode.
-
-Probe encodes use `probe_preset`; the final encode uses the preset from `[encoder_params]`. A probe is accepted when its VMAF falls within `[vmaf - tolerance_under, vmaf + tolerance_over]`. The two tolerances are independent, so the accepted band does not have to be symmetric around the target.
 
 `crf` in `[encoder_params]` is ignored while target quality is active (it is used only as the first probe seed). Solved CRFs are cached, so a resume does not re-probe.
 

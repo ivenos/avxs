@@ -10,9 +10,10 @@ use crate::ext::external_bin;
 use crate::resume::SceneEntry;
 
 /// Per-call CRF/preset overrides (target quality probes and final encode).
+/// CRF is fractional: the SVT-AV1 encoders accept 0.25 steps.
 #[derive(Default, Clone, Copy)]
 pub struct EncodeOverrides {
-    pub crf: Option<u32>,
+    pub crf: Option<f64>,
     pub preset: Option<u32>,
 }
 

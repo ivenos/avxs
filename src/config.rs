@@ -239,28 +239,32 @@ impl SceneDetectionConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct TargetQualityConfig {
-    /// VMAF score to target per chunk. 0 is rejected by validate().
+    /// VMAF score to hold as a hard minimum per chunk. 0 is rejected by validate().
     pub vmaf: f64,
+    /// CRF search bounds.
     pub min_crf: u32,
     pub max_crf: u32,
-    pub probes: u32,
+    /// Probe budget per chunk. The search stops early once it converges.
+    pub min_probes: u32,
+    pub max_probes: u32,
+    /// Stop early when a probe lands at most this far above the floor.
+    pub tolerance: f64,
     pub probe_preset: u32,
-    /// Accept a probe that lands up to this far below the target.
-    pub tolerance_under: f64,
-    /// Accept a probe that lands up to this far above the target.
-    pub tolerance_over: f64,
+    /// Encoded size ceiling as a percent of the source over the chunk duration.
+    pub max_encoded_percent: f64,
 }
 
 impl Default for TargetQualityConfig {
     fn default() -> Self {
         Self {
             vmaf: 0.0,
-            min_crf: 18,
+            min_crf: 14,
             max_crf: 45,
-            probes: 4,
+            min_probes: 2,
+            max_probes: 7,
+            tolerance: 0.5,
             probe_preset: 13,
-            tolerance_under: 0.5,
-            tolerance_over: 2.0,
+            max_encoded_percent: 90.0,
         }
     }
 }
@@ -294,17 +298,23 @@ impl Config {
             if tq.min_crf >= tq.max_crf {
                 bail!("target_quality.min_crf must be < max_crf ({} >= {})", tq.min_crf, tq.max_crf);
             }
-            if tq.max_crf > 63 {
-                bail!("target_quality.max_crf must be <= 63 (got {})", tq.max_crf);
+            if tq.max_crf > 70 {
+                bail!("target_quality.max_crf must be <= 70 (got {})", tq.max_crf);
             }
-            if tq.probes < 2 {
-                bail!("target_quality.probes must be >= 2 (got {})", tq.probes);
+            if tq.min_probes < 2 {
+                bail!("target_quality.min_probes must be >= 2 (got {})", tq.min_probes);
+            }
+            if tq.max_probes < tq.min_probes {
+                bail!("target_quality.max_probes must be >= min_probes ({} < {})", tq.max_probes, tq.min_probes);
             }
             if tq.probe_preset > 13 {
                 bail!("target_quality.probe_preset must be 0..=13 (got {})", tq.probe_preset);
             }
-            if tq.tolerance_under < 0.0 || tq.tolerance_over < 0.0 {
-                bail!("target_quality tolerances must be >= 0");
+            if tq.tolerance < 0.0 {
+                bail!("target_quality.tolerance must be >= 0 (got {})", tq.tolerance);
+            }
+            if tq.max_encoded_percent <= 0.0 {
+                bail!("target_quality.max_encoded_percent must be > 0 (got {})", tq.max_encoded_percent);
             }
         }
         validate_audio("audio", self.audio.mode, self.audio.codec.as_deref(), self.audio.bitrate.as_ref())?;
@@ -464,8 +474,8 @@ mod tests {
         let c: Config = toml::from_str("encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95").unwrap();
         c.validate().unwrap();
         let tq = c.target_quality.unwrap();
-        assert_eq!((tq.min_crf, tq.max_crf, tq.probes, tq.probe_preset), (18, 45, 4, 13));
-        assert_eq!((tq.tolerance_under, tq.tolerance_over), (0.5, 2.0));
+        assert_eq!((tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset), (14, 45, 2, 7, 13));
+        assert_eq!((tq.tolerance, tq.max_encoded_percent), (0.5, 90.0));
     }
 
     #[test]
@@ -474,9 +484,11 @@ mod tests {
             "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 0",
             "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 101",
             "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmin_crf = 40\nmax_crf = 30",
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmax_crf = 70",
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nprobes = 1",
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmax_crf = 71",
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmin_probes = 1",
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmin_probes = 5\nmax_probes = 3",
             "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nprobe_preset = 14",
+            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmax_encoded_percent = 0",
         ];
         for t in bad {
             let c: Config = toml::from_str(t).unwrap();

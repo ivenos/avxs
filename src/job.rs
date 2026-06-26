@@ -34,6 +34,8 @@ struct WorkerCtx {
     stem: String,
     total_chunks: usize,
     total_frames: u64,
+    /// Cumulative source byte sizes by frame for the size cap; empty when unused.
+    source_byte_index: Arc<Vec<u64>>,
 }
 
 pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
@@ -135,7 +137,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     // Discard cached scenes/chunks if the encode profile changed since the last run,
     // so a resumed encode never mixes chunks from different settings.
-    let fingerprint = profile_fingerprint(&merged_args, &encode_opts, &config.scene_detection);
+    let fingerprint = profile_fingerprint(&merged_args, &encode_opts, &config.scene_detection, config.target_quality.as_ref());
     invalidate_stale_cache(&temp, &fingerprint, stem)?;
 
     let scenes: Vec<SceneEntry> = if temp.scenes_path.exists() {
@@ -204,8 +206,8 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
             target_quality::ensure_available().await?;
             let model = target_quality::model_for_height(output_height).to_string();
             tracing::info!(
-                "[{stem}] target quality: VMAF {} (model {model}, crf {}-{}, {} probes, probe preset {})",
-                tq.vmaf, tq.min_crf, tq.max_crf, tq.probes, tq.probe_preset
+                "[{stem}] target quality: VMAF {} floor (model {model}, crf {}-{}, {}-{} probes, probe preset {}, max {}% size)",
+                tq.vmaf, tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset, tq.max_encoded_percent
             );
             if config.encoder_params.contains_key("crf") {
                 tracing::info!("[{stem}] target quality: crf in encoder_params used only as a probe seed");
@@ -223,6 +225,13 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let completed_frames   = Arc::new(AtomicU64::new(0));
     let mut set = tokio::task::JoinSet::new();
 
+    // Actual source bytes per frame for the size cap (target quality only).
+    let source_byte_index = if config.target_quality.is_some() {
+        Arc::new(probe_source_byte_index(&job.source_file).await)
+    } else {
+        Arc::new(Vec::new())
+    };
+
     let wctx = Arc::new(WorkerCtx {
         source: job.source_file.clone(),
         index: temp.index_path.clone(),
@@ -236,6 +245,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         stem: stem.to_owned(),
         total_chunks,
         total_frames,
+        source_byte_index,
     });
 
     for scene in &scenes {
@@ -347,36 +357,53 @@ async fn finalize(
 
 /// Target-quality CRF for a chunk: cached value, else probe-and-solve (then cache it).
 /// Returns None when target quality is not active.
-async fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Option<u32>> {
+async fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Option<f64>> {
     let (Some(tq), Some(model), Some(cache)) = (&w.tq, &w.tq_model, &w.crf_cache) else {
         return Ok(None);
     };
     if let Some(c) = cache.get(chunk_key).await {
+        tracing::info!("[{}] chunk {chunk_key} using cached target crf {c}", w.stem);
         return Ok(Some(c));
     }
 
-    let source    = w.source.clone();
-    let index     = w.index.clone();
-    let temp_dir  = w.temp_dir.clone();
-    let config    = Arc::clone(&w.config);
-    let opts      = Arc::clone(&w.opts);
-    let tq        = tq.clone();
-    let model     = model.clone();
-    let scene     = scene.clone();
-    let n_threads = w.threads_per_worker;
-    let solved = tokio::task::spawn_blocking(move || {
+    let source       = w.source.clone();
+    let index        = w.index.clone();
+    let temp_dir     = w.temp_dir.clone();
+    let config       = Arc::clone(&w.config);
+    let opts         = Arc::clone(&w.opts);
+    let tq           = tq.clone();
+    let model        = model.clone();
+    let scene        = scene.clone();
+    let stem         = w.stem.clone();
+    let n_threads    = w.threads_per_worker;
+    let byte_index   = Arc::clone(&w.source_byte_index);
+    let res = tokio::task::spawn_blocking(move || {
         let ctx = target_quality::ProbeContext {
             source: &source, index: &index, temp_dir: &temp_dir,
             config: &config, opts: &opts, tq: &tq, model: &model, n_threads,
+            stem: &stem, source_byte_index: &byte_index,
         };
         target_quality::solve_chunk_crf(&ctx, &scene)
     })
     .await
     .context("spawn_blocking solve_chunk_crf")??;
 
-    cache.insert(chunk_key, solved).await?;
-    tracing::info!("[{}] chunk {chunk_key} target crf {solved}", w.stem);
-    Ok(Some(solved))
+    cache.insert(chunk_key, res.crf).await?;
+    match res.outcome {
+        target_quality::SolveOutcome::Met => tracing::info!(
+            "[{}] chunk {chunk_key} target crf {} (VMAF {:.2}, {:.0}% size)",
+            w.stem, res.crf, res.vmaf, res.size_pct
+        ),
+        target_quality::SolveOutcome::CapBinding => tracing::warn!(
+            "[{}] chunk {chunk_key} crf {} capped by max_encoded_percent (VMAF {:.2} below floor, {:.0}% size)",
+            w.stem, res.crf, res.vmaf, res.size_pct
+        ),
+        target_quality::SolveOutcome::FloorUnreachable => tracing::warn!(
+            "[{}] chunk {chunk_key} VMAF floor unreachable, using crf {} (VMAF {:.2})",
+            w.stem, res.crf, res.vmaf
+        ),
+    }
+    Ok(Some(res.crf))
 }
 
 pub fn handle_failure(_job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Error) {
@@ -470,6 +497,7 @@ fn profile_fingerprint(
     merged_args: &[String],
     opts: &EncodeOptions,
     scene_cfg: &crate::config::SceneDetectionConfig,
+    tq: Option<&TargetQualityConfig>,
 ) -> String {
     use std::hash::{Hash, Hasher};
     let parts = [
@@ -478,6 +506,7 @@ fn profile_fingerprint(
         format!("{:?}", opts.crop),
         format!("{:?}", opts.target_bit_depth),
         format!("{scene_cfg:?}"),
+        format!("{tq:?}"),
     ];
     let mut h = std::collections::hash_map::DefaultHasher::new();
     parts.join("|").hash(&mut h);
@@ -539,6 +568,38 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// Cumulative source video byte sizes by frame, for the target-quality size cap.
+/// One ffprobe pass over the packets (no decoding); empty on failure (cap disabled).
+async fn probe_source_byte_index(source: &Path) -> Vec<u64> {
+    #[derive(serde::Deserialize)]
+    struct Packets { #[serde(default)] packets: Vec<Pkt> }
+    #[derive(serde::Deserialize)]
+    struct Pkt { #[serde(default)] size: Option<String> }
+
+    let parsed: Packets = match crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", "v:0",
+          "-show_entries", "packet=size", "-of", "json"],
+        source,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("source packet-size probe failed: {e:#} - size cap disabled");
+            return Vec::new();
+        }
+    };
+
+    let mut cum = Vec::with_capacity(parsed.packets.len() + 1);
+    let mut acc = 0u64;
+    cum.push(0);
+    for pk in &parsed.packets {
+        acc += pk.size.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
+        cum.push(acc);
+    }
+    cum
+}
+
 async fn probe_fps(source: &Path) -> Result<(u32, u32)> {
     #[derive(serde::Deserialize)]
     struct Probe { streams: Vec<Stream> }
@@ -578,19 +639,23 @@ mod tests {
     fn fingerprint_changes_with_profile() {
         let args = vec!["--crf".to_string(), "28".to_string()];
         let sc = SceneDetectionConfig::default();
-        let base = profile_fingerprint(&args, &opts(), &sc);
+        let base = profile_fingerprint(&args, &opts(), &sc, None);
 
         // identical inputs -> identical fingerprint
-        assert_eq!(base, profile_fingerprint(&args, &opts(), &sc));
+        assert_eq!(base, profile_fingerprint(&args, &opts(), &sc, None));
 
         // encoder-arg change -> different
         let args2 = vec!["--crf".to_string(), "30".to_string()];
-        assert_ne!(base, profile_fingerprint(&args2, &opts(), &sc));
+        assert_ne!(base, profile_fingerprint(&args2, &opts(), &sc, None));
 
         // scale change -> different
         let mut o = opts();
         o.scale = Some((1920, 1080));
-        assert_ne!(base, profile_fingerprint(&args, &o, &sc));
+        assert_ne!(base, profile_fingerprint(&args, &o, &sc, None));
+
+        // target_quality change -> different
+        let tq = crate::config::TargetQualityConfig { vmaf: 96.0, ..Default::default() };
+        assert_ne!(base, profile_fingerprint(&args, &opts(), &sc, Some(&tq)));
     }
 }
 
