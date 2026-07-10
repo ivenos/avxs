@@ -1,39 +1,95 @@
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::config::{Config, TargetQualityConfig};
 use crate::encode::{self, EncodeOptions};
 use crate::ext::external_bin;
-use crate::ffms2::{Crop, OpenOpts, VideoSource};
+use crate::ffms2::Crop;
 use crate::resume::SceneEntry;
-
-// VMAF v1 models, picked by output height (1080p vs 4K). Built into the bundled libvmaf.
-const MODEL_1080: &str = "vmaf_v1.0.16_3d0h";
-const MODEL_2160: &str = "vmaf_v1.0.16_1d5h_2160";
 
 // CRF granularity of the SVT-AV1 encoders (and the HDR fork): quarter steps.
 const CRF_STEP: f64 = 0.25;
 
-/// VMAF v1 model for the output height.
-pub fn model_for_height(output_height: u32) -> &'static str {
-    if output_height >= 1440 { MODEL_2160 } else { MODEL_1080 }
+// Nominal JOD drop per CRF step, used only to seed the first interpolation from a
+// single probe. Calibrated on 4K HDR SVT-AV1 material (~0.02-0.03 JOD per CRF near
+// the target zone); the search refines it from the real probes.
+const NOMINAL_JOD_PER_CRF: f64 = 0.025;
+
+/// CVVDP display model for the output. HDR selects the PQ or HLG display by the
+/// encoded transfer; SDR picks the 4K or FHD display by output height.
+pub fn display_model_for(output_height: u32, hdr: bool, hlg: bool) -> &'static str {
+    if hdr && hlg {
+        "standard_hdr_hlg"
+    } else if hdr {
+        "standard_hdr_pq"
+    } else if output_height >= 1440 {
+        "standard_4k"
+    } else {
+        "standard_fhd"
+    }
 }
 
-/// Confirms the bundled `vmaf` tool is runnable; called once before probing.
-pub async fn ensure_available() -> Result<()> {
-    let out = tokio::process::Command::new(external_bin("vmaf"))
-        .arg("--version")
+/// True when the auto-HDR args select the HLG transfer (arib-std-b67 = 18);
+/// otherwise HDR is treated as PQ (HDR10, plus the DV/HDR10+ HDR10 fallback).
+pub fn hdr_args_are_hlg(hdr_args: &[String]) -> bool {
+    hdr_args.windows(2).any(|w| w[0] == "--transfer-characteristics" && w[1] == "18")
+}
+
+/// A Vulkan device picked by FFVship for the metric run.
+#[derive(Clone, Debug)]
+pub struct GpuSelection {
+    pub id: u32,
+    pub label: String,
+    /// False when the device is a software rasterizer (llvmpipe): the CPU fallback.
+    pub hardware: bool,
+}
+
+impl GpuSelection {
+    pub fn describe(&self) -> String {
+        if self.hardware {
+            format!("gpu {} {}", self.id, self.label)
+        } else {
+            format!("gpu {} {} (software/CPU fallback)", self.id, self.label)
+        }
+    }
+}
+
+/// Confirms FFVship runs and picks a Vulkan device: the first hardware GPU, or the
+/// software rasterizer (llvmpipe) as a CPU fallback when no GPU is present.
+pub async fn ensure_available() -> Result<GpuSelection> {
+    let out = tokio::process::Command::new(external_bin("FFVship"))
+        .arg("--list-gpu")
         .output()
         .await
-        .context("run vmaf --version (is the vmaf tool bundled?)")?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        bail!("vmaf tool is not runnable: {}", String::from_utf8_lossy(&out.stderr).trim());
+        .context("run FFVship --list-gpu (is the FFVship tool bundled?)")?;
+    if !out.status.success() {
+        bail!("FFVship is not runnable: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
+    let text = String::from_utf8_lossy(&out.stdout);
+    select_gpu(&text)
+        .ok_or_else(|| anyhow!("FFVship --list-gpu reported no Vulkan device:\n{}", text.trim()))
+}
+
+/// Parses `FFVship --list-gpu` ("GPU <id>: <name>") and picks the first hardware
+/// device, falling back to the first software device (llvmpipe) as the CPU path.
+fn select_gpu(list: &str) -> Option<GpuSelection> {
+    let mut devices: Vec<GpuSelection> = Vec::new();
+    for line in list.lines() {
+        let Some(rest) = line.trim().strip_prefix("GPU ") else { continue };
+        let Some((id_str, name)) = rest.split_once(':') else { continue };
+        let Ok(id) = id_str.trim().parse::<u32>() else { continue };
+        let label = name.trim().to_string();
+        let low = label.to_lowercase();
+        let hardware =
+            !low.contains("llvmpipe") && !low.contains("software") && !low.contains("swrast");
+        devices.push(GpuSelection { id, label, hardware });
+    }
+    devices
+        .iter()
+        .find(|d| d.hardware)
+        .cloned()
+        .or_else(|| devices.into_iter().next())
 }
 
 pub struct ProbeContext<'a> {
@@ -43,7 +99,11 @@ pub struct ProbeContext<'a> {
     pub config: &'a Config,
     pub opts: &'a EncodeOptions,
     pub tq: &'a TargetQualityConfig,
-    pub model: &'a str,
+    pub display_model: &'a str,
+    pub gpu_id: u32,
+    /// Source dimensions, needed to turn avxs crop (offset+size) into FFVship edge crops.
+    pub source_width: u32,
+    pub source_height: u32,
     pub n_threads: usize,
     pub stem: &'a str,
     /// Cumulative source byte sizes by frame (len = frames + 1); empty disables the cap.
@@ -53,15 +113,15 @@ pub struct ProbeContext<'a> {
 #[derive(Clone, Copy)]
 struct Probe {
     crf: f64,
-    vmaf: f64,
+    jod: f64,
     size_pct: f64,
 }
 
 /// Why the search settled on its CRF, for logging.
 pub enum SolveOutcome {
-    /// Highest CRF that holds the VMAF floor within the size cap.
+    /// Highest CRF that holds the JOD floor within the size cap.
     Met,
-    /// Size cap forced a higher CRF than the floor allowed; VMAF is below target.
+    /// Size cap forced a higher CRF than the floor allowed; JOD is below target.
     CapBinding,
     /// Floor unreachable in the CRF range; best-quality probe used.
     FloorUnreachable,
@@ -69,18 +129,18 @@ pub enum SolveOutcome {
 
 pub struct SolveResult {
     pub crf: f64,
-    pub vmaf: f64,
+    pub jod: f64,
     pub size_pct: f64,
     pub outcome: SolveOutcome,
 }
 
-/// Finds the highest CRF whose VMAF holds the floor `tq.vmaf` and whose size
-/// stays under `tq.max_encoded_percent`. VMAF falls monotonically as CRF rises,
-/// so this is a threshold search: interpolated binary search on a 0.25 grid.
+/// Finds the highest CRF whose JOD holds the floor `tq.jod` and whose size stays
+/// under `tq.max_encoded_percent`. JOD falls monotonically as CRF rises, so this is
+/// a threshold search: interpolated binary search on a 0.25 grid.
 pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveResult> {
     let lo = ctx.tq.min_crf as f64;
     let hi = ctx.tq.max_crf as f64;
-    let target = ctx.tq.vmaf;
+    let target = ctx.tq.jod;
     let tol = ctx.tq.tolerance;
     let cap = ctx.tq.max_encoded_percent;
     let key = scene.padded_index();
@@ -89,16 +149,16 @@ pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveRe
     let mut crf = round_to_step(seed_crf(ctx.config, lo, hi), lo, hi);
 
     for i in 0..ctx.tq.max_probes {
-        let (vmaf, size_pct) = probe_once(ctx, scene, crf)?;
+        let (jod, size_pct) = probe_once(ctx, scene, crf)?;
         tracing::info!(
-            "[{}] chunk {key} probe {}/{} crf {crf} gives VMAF {vmaf:.2}, {size_pct:.0}% size",
+            "[{}] chunk {key} probe {}/{} crf {crf} gives JOD {jod:.3}, {size_pct:.0}% size",
             ctx.stem, i + 1, ctx.tq.max_probes
         );
-        pts.push(Probe { crf, vmaf, size_pct });
+        pts.push(Probe { crf, jod, size_pct });
 
         // early stop: just above the floor, within the size cap, after min_probes
         if i + 1 >= ctx.tq.min_probes
-            && vmaf >= target && vmaf <= target + tol && size_pct <= cap
+            && jod >= target && jod <= target + tol && size_pct <= cap
         {
             break;
         }
@@ -125,7 +185,7 @@ fn seed_crf(config: &Config, lo: f64, hi: f64) -> f64 {
         .clamp(lo, hi)
 }
 
-/// Encodes the chunk at `crf` (probe preset), measures VMAF, and reports the
+/// Encodes the chunk at `crf` (probe preset), measures CVVDP JOD, and reports the
 /// encoded size relative to the source over the chunk's duration.
 fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<(f64, f64)> {
     let tag = format!("{}_{crf}", scene.padded_index());
@@ -147,20 +207,18 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<(f64, 
         index: ctx.index,
         work_dir: ctx.temp_dir,
         start: scene.start_frame,
-        end: scene.end_frame,
         crop: ctx.opts.crop,
-        scale: ctx.opts.scale,
-        target_bit_depth: ctx.opts.target_bit_depth,
-        fps_num: ctx.opts.fps_num,
-        fps_den: ctx.opts.fps_den,
-        model: ctx.model,
+        source_width: ctx.source_width,
+        source_height: ctx.source_height,
+        display_model: ctx.display_model,
+        gpu_id: ctx.gpu_id,
         n_threads: ctx.n_threads,
         tag: &tag,
     });
     let _ = std::fs::remove_file(&probe);
-    let vmaf = result?;
+    let jod = result?;
     let size_pct = chunk_size_pct(size_bytes, ctx.source_byte_index, scene.start_frame, scene.end_frame);
-    Ok((vmaf, size_pct))
+    Ok((jod, size_pct))
 }
 
 /// Encoded size as a percent of the source's actual bytes for this chunk's frames.
@@ -175,8 +233,8 @@ fn chunk_size_pct(encoded: u64, cum: &[u64], start: u64, end: u64) -> f64 {
 /// Picks the next CRF to probe, or None when the crossing is bracketed to one
 /// 0.25 step, a bound is reached, or no new grid point remains.
 fn next_crf(pts: &[Probe], target: f64, lo: f64, hi: f64) -> Option<f64> {
-    let pass: Vec<f64> = pts.iter().filter(|p| p.vmaf >= target).map(|p| p.crf).collect();
-    let fail: Vec<f64> = pts.iter().filter(|p| p.vmaf <  target).map(|p| p.crf).collect();
+    let pass: Vec<f64> = pts.iter().filter(|p| p.jod >= target).map(|p| p.crf).collect();
+    let fail: Vec<f64> = pts.iter().filter(|p| p.jod <  target).map(|p| p.crf).collect();
 
     if !pass.is_empty() && !fail.is_empty() {
         let p = pass.iter().copied().fold(f64::MIN, f64::max); // highest CRF still passing
@@ -211,11 +269,10 @@ fn next_crf(pts: &[Probe], target: f64, lo: f64, hi: f64) -> Option<f64> {
     }
 }
 
-/// Linear (secant) estimate of the CRF that yields `target` VMAF.
+/// Linear (secant) estimate of the CRF that yields `target` JOD.
 fn interpolate_crf(pts: &[Probe], target: f64) -> f64 {
     if pts.len() == 1 {
-        // nominal slope of ~0.4 VMAF per CRF step
-        return pts[0].crf + (pts[0].vmaf - target) / 0.4;
+        return pts[0].crf + (pts[0].jod - target) / NOMINAL_JOD_PER_CRF;
     }
     let (a, b) = bracket_pts(pts, target);
     if (a.1 - b.1).abs() < 1e-6 {
@@ -225,17 +282,17 @@ fn interpolate_crf(pts: &[Probe], target: f64) -> f64 {
     a.0 + slope * (target - a.1)
 }
 
-/// Two (crf, vmaf) points to interpolate between: one at/above and one below the
-/// target if possible, otherwise the two closest in VMAF.
+/// Two (crf, jod) points to interpolate between: one at/above and one below the
+/// target if possible, otherwise the two closest in JOD.
 fn bracket_pts(pts: &[Probe], target: f64) -> ((f64, f64), (f64, f64)) {
-    let above = pts.iter().filter(|p| p.vmaf >= target).min_by(|x, y| x.vmaf.total_cmp(&y.vmaf));
-    let below = pts.iter().filter(|p| p.vmaf <  target).max_by(|x, y| x.vmaf.total_cmp(&y.vmaf));
+    let above = pts.iter().filter(|p| p.jod >= target).min_by(|x, y| x.jod.total_cmp(&y.jod));
+    let below = pts.iter().filter(|p| p.jod <  target).max_by(|x, y| x.jod.total_cmp(&y.jod));
     if let (Some(a), Some(b)) = (above, below) {
-        return ((a.crf, a.vmaf), (b.crf, b.vmaf));
+        return ((a.crf, a.jod), (b.crf, b.jod));
     }
     let mut sorted: Vec<&Probe> = pts.iter().collect();
-    sorted.sort_by(|x, y| (x.vmaf - target).abs().total_cmp(&(y.vmaf - target).abs()));
-    ((sorted[0].crf, sorted[0].vmaf), (sorted[1].crf, sorted[1].vmaf))
+    sorted.sort_by(|x, y| (x.jod - target).abs().total_cmp(&(y.jod - target).abs()));
+    ((sorted[0].crf, sorted[0].jod), (sorted[1].crf, sorted[1].jod))
 }
 
 fn round_to_step(v: f64, lo: f64, hi: f64) -> f64 {
@@ -251,55 +308,42 @@ fn already(pts: &[Probe], crf: f64) -> bool {
 /// a higher CRF than the floor allows, the cap wins. If nothing holds the floor,
 /// the best-quality probe is used.
 fn decide(pts: &[Probe], target: f64, cap: f64, lo: f64) -> SolveResult {
-    let floor = pts.iter().filter(|p| p.vmaf >= target)
+    let floor = pts.iter().filter(|p| p.jod >= target)
         .max_by(|a, b| a.crf.total_cmp(&b.crf)).copied();
     let under_cap = pts.iter().filter(|p| p.size_pct <= cap)
         .min_by(|a, b| a.crf.total_cmp(&b.crf)).copied();
 
-    let res = |p: Probe, outcome| SolveResult { crf: p.crf, vmaf: p.vmaf, size_pct: p.size_pct, outcome };
+    let res = |p: Probe, outcome| SolveResult { crf: p.crf, jod: p.jod, size_pct: p.size_pct, outcome };
 
     match (floor, under_cap) {
         (Some(fl), Some(sz)) if sz.crf > fl.crf + 1e-9 => res(sz, SolveOutcome::CapBinding),
         (Some(fl), _) => res(fl, SolveOutcome::Met),
         (None, _) => pts.iter()
-            .max_by(|a, b| a.vmaf.total_cmp(&b.vmaf))
+            .max_by(|a, b| a.jod.total_cmp(&b.jod))
             .map(|&p| res(p, SolveOutcome::FloorUnreachable))
-            .unwrap_or(SolveResult { crf: lo, vmaf: f64::NAN, size_pct: f64::NAN, outcome: SolveOutcome::FloorUnreachable }),
+            .unwrap_or(SolveResult { crf: lo, jod: f64::NAN, size_pct: f64::NAN, outcome: SolveOutcome::FloorUnreachable }),
     }
 }
 
 struct MeasureOpts<'a> {
     distorted: &'a Path,
     source: &'a Path,
+    /// avxs's existing FFMS2 index for the source, reused read-only by FFVship.
     index: &'a Path,
     work_dir: &'a Path,
+    /// First source frame of the chunk; the probe holds those frames from 0.
     start: u64,
-    end: u64,
     crop: Option<Crop>,
-    scale: Option<(u32, u32)>,
-    target_bit_depth: Option<u8>,
-    fps_num: u32,
-    fps_den: u32,
-    model: &'a str,
+    source_width: u32,
+    source_height: u32,
+    display_model: &'a str,
+    gpu_id: u32,
     n_threads: usize,
-    /// Unique suffix for the per-measurement fifo/log files.
+    /// Unique suffix for the per-measurement json file.
     tag: &'a str,
 }
 
-#[derive(Deserialize)]
-struct VmafLog {
-    pooled_metrics: Pooled,
-}
-#[derive(Deserialize)]
-struct Pooled {
-    vmaf: Stats,
-}
-#[derive(Deserialize)]
-struct Stats {
-    mean: f64,
-}
-
-/// Removes its paths on drop so fifos/logs never linger after a measurement.
+/// Removes its paths on drop so the json never lingers after a measurement.
 struct Cleanup(Vec<PathBuf>);
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -309,118 +353,118 @@ impl Drop for Cleanup {
     }
 }
 
-/// Mean VMAF of `distorted` against source frames `start..=end`, both fed to the
-/// `vmaf` tool as 10-bit Y4M over fifos (reference cropped+scaled like the encode).
+/// Whole-chunk CVVDP JOD of `distorted` (the probe, frames from 0) against the
+/// source starting at `start`. FFVship decodes both via ffms2, crops the source to
+/// match the encode, resizes the encode on any size mismatch, and writes per-frame
+/// cumulative JOD; the last value is the chunk score.
 fn measure(m: &MeasureOpts) -> Result<f64> {
-    let ref_fifo  = m.work_dir.join(format!("vmaf_ref_{}.y4m", m.tag));
-    let dist_fifo = m.work_dir.join(format!("vmaf_dist_{}.y4m", m.tag));
-    let json      = m.work_dir.join(format!("vmaf_{}.json", m.tag));
-    let _cleanup = Cleanup(vec![ref_fifo.clone(), dist_fifo.clone(), json.clone()]);
+    let json = m.work_dir.join(format!("cvvdp_{}.json", m.tag));
+    let _cleanup = Cleanup(vec![json.clone()]);
 
-    for f in [&ref_fifo, &dist_fifo] {
-        let _ = std::fs::remove_file(f);
-        make_fifo(f)?;
+    let mut cmd = std::process::Command::new(external_bin("FFVship"));
+    cmd.arg("-s").arg(m.source)
+        .arg("-e").arg(m.distorted)
+        .args(["-m", "CVVDP"])
+        .arg("--source-index").arg(m.index)
+        .args(["--start", &m.start.to_string()])
+        .args(["--encoded-offset", &format!("-{}", m.start)])
+        .args(["--displayModel", m.display_model])
+        .args(["--gpu-id", &m.gpu_id.to_string()])
+        .args(["-t", &m.n_threads.to_string()])
+        .args(["-g", "3"])
+        .arg("--json").arg(&json);
+
+    // avxs crop is offset+size in source space; FFVship wants per-edge amounts.
+    if let Some(c) = m.crop {
+        let right = m.source_width.saturating_sub(c.x + c.w);
+        let bottom = m.source_height.saturating_sub(c.y + c.h);
+        cmd.args(["--cropLeftSource", &c.x.to_string()])
+            .args(["--cropTopSource", &c.y.to_string()])
+            .args(["--cropRightSource", &right.to_string()])
+            .args(["--cropBottomSource", &bottom.to_string()]);
     }
 
-    // Distorted: decode the AV1 probe to 10-bit Y4M into its fifo.
-    let mut dist_ff = std::process::Command::new(external_bin("ffmpeg"))
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-        .arg(m.distorted)
-        .args(["-vf", "format=yuv420p10le", "-strict", "-1", "-f", "yuv4mpegpipe"])
-        .arg(&dist_fifo)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start ffmpeg (decode distorted for vmaf)")?;
-
-    // Reference: FFMS2 (cropped) piped through ffmpeg for scale + 10-bit into its fifo.
-    let vf = match m.scale {
-        Some((w, h)) => format!("scale={w}:{h}:flags=lanczos,format=yuv420p10le"),
-        None         => "format=yuv420p10le".to_string(),
-    };
-    let mut ref_ff = std::process::Command::new(external_bin("ffmpeg"))
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "yuv4mpegpipe", "-i", "pipe:0"])
-        .args(["-vf", &vf, "-strict", "-1", "-f", "yuv4mpegpipe"])
-        .arg(&ref_fifo)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start ffmpeg (reference for vmaf)")?;
-    let ref_stdin = ref_ff.stdin.take().expect("ref ffmpeg stdin unavailable");
-
-    // FFMS2 pointer is not Send, so open the source inside the writer thread.
-    let source = m.source.to_path_buf();
-    let index  = m.index.to_path_buf();
-    let (start, end) = (m.start, m.end);
-    let crop = m.crop;
-    let depth = m.target_bit_depth;
-    let (fps_num, fps_den) = (m.fps_num, m.fps_den);
-    let writer = std::thread::spawn(move || -> Result<()> {
-        let mut vs = VideoSource::open(&source, &index, OpenOpts { target_bit_depth: depth })
-            .context("open FFMS2 for vmaf reference")?;
-        vs.info.fps_num = fps_num;
-        vs.info.fps_den = fps_den;
-        let mut w = BufWriter::with_capacity(256 * 1024, ref_stdin);
-        vs.write_y4m_range(&mut w, start, end, crop).context("write Y4M reference")?;
-        Ok(())
-    });
-
-    let model_arg = format!("version={}", m.model);
-    let out = std::process::Command::new(external_bin("vmaf"))
-        .arg("-r").arg(&ref_fifo)
-        .arg("-d").arg(&dist_fifo)
-        .args(["-m", &model_arg, "--json", "-o"])
-        .arg(&json)
-        .args(["--threads", &m.n_threads.to_string()])
+    let out = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .context("run vmaf")?;
-
-    let _ = dist_ff.wait();
-    let _ = ref_ff.wait();
-    let writer_res = writer.join().map_err(|_| anyhow!("vmaf reference writer panicked"))?;
-
+        .context("run FFVship")?;
     if !out.status.success() {
-        bail!("vmaf failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        bail!("FFVship failed:\n{}", String::from_utf8_lossy(&out.stderr));
     }
-    writer_res?;
 
     let raw = std::fs::read_to_string(&json)
-        .with_context(|| format!("read vmaf json: {}", json.display()))?;
-    let log: VmafLog = serde_json::from_str(&raw).context("parse vmaf json")?;
-    Ok(log.pooled_metrics.vmaf.mean)
+        .with_context(|| format!("read FFVship json: {}", json.display()))?;
+    parse_cvvdp(&raw)
 }
 
-fn make_fifo(path: &Path) -> Result<()> {
-    let status = std::process::Command::new("mkfifo")
-        .arg(path)
-        .status()
-        .context("run mkfifo")?;
-    if !status.success() {
-        bail!("mkfifo failed for {}", path.display());
-    }
-    Ok(())
+/// CVVDP JSON is `[[cum_0_0], [cum_0_1], ...]`; the last row's value is the score
+/// of the whole clip (frame 0 to last).
+fn parse_cvvdp(raw: &str) -> Result<f64> {
+    let rows: Vec<Vec<f64>> = serde_json::from_str(raw).context("parse FFVship CVVDP json")?;
+    rows.last()
+        .and_then(|r| r.last())
+        .copied()
+        .ok_or_else(|| anyhow!("FFVship CVVDP json had no scores"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn p(crf: f64, vmaf: f64, size_pct: f64) -> Probe {
-        Probe { crf, vmaf, size_pct }
+    fn p(crf: f64, jod: f64, size_pct: f64) -> Probe {
+        Probe { crf, jod, size_pct }
     }
 
     #[test]
-    fn model_picked_by_height() {
-        assert_eq!(model_for_height(720), MODEL_1080);
-        assert_eq!(model_for_height(1080), MODEL_1080);
-        assert_eq!(model_for_height(1439), MODEL_1080);
-        assert_eq!(model_for_height(1440), MODEL_2160);
-        assert_eq!(model_for_height(2160), MODEL_2160);
+    fn display_model_picked_by_height_and_hdr() {
+        assert_eq!(display_model_for(720, false, false), "standard_fhd");
+        assert_eq!(display_model_for(1080, false, false), "standard_fhd");
+        assert_eq!(display_model_for(1439, false, false), "standard_fhd");
+        assert_eq!(display_model_for(1440, false, false), "standard_4k");
+        assert_eq!(display_model_for(2160, false, false), "standard_4k");
+        assert_eq!(display_model_for(2160, true, false), "standard_hdr_pq");
+        // HLG picks the HLG display even at 4K
+        assert_eq!(display_model_for(2160, true, true), "standard_hdr_hlg");
+    }
+
+    #[test]
+    fn hlg_detected_from_transfer_arg() {
+        let pq = vec!["--transfer-characteristics".to_string(), "16".to_string()];
+        let hlg = vec!["--transfer-characteristics".to_string(), "18".to_string()];
+        assert!(!hdr_args_are_hlg(&pq));
+        assert!(hdr_args_are_hlg(&hlg));
+        assert!(!hdr_args_are_hlg(&[]));
+    }
+
+    #[test]
+    fn select_gpu_prefers_hardware() {
+        let list = "GPU 0: NVIDIA GeForce RTX 5060 Ti\nGPU 1: llvmpipe (LLVM 22.1.7, 256 bits)\n";
+        let g = select_gpu(list).unwrap();
+        assert_eq!(g.id, 0);
+        assert!(g.hardware);
+    }
+
+    #[test]
+    fn select_gpu_picks_hardware_even_after_software() {
+        let list = "GPU 0: llvmpipe (LLVM 22.1.7)\nGPU 1: Intel Graphics\n";
+        let g = select_gpu(list).unwrap();
+        assert_eq!(g.id, 1);
+        assert!(g.hardware);
+    }
+
+    #[test]
+    fn select_gpu_falls_back_to_software() {
+        let g = select_gpu("GPU 0: llvmpipe (LLVM 22.1.7)\n").unwrap();
+        assert_eq!(g.id, 0);
+        assert!(!g.hardware);
+    }
+
+    #[test]
+    fn parse_cvvdp_takes_last_cumulative() {
+        assert!((parse_cvvdp("[[9.95],[9.90],[9.83]]").unwrap() - 9.83).abs() < 1e-9);
+        assert!(parse_cvvdp("[]").is_err());
     }
 
     #[test]
@@ -434,27 +478,25 @@ mod tests {
 
     #[test]
     fn chunk_size_pct_uses_actual_source_bytes() {
-        // cumulative bytes by frame: frames 0..=2 are 100+200+300 = 600 source bytes
         let cum = [0u64, 100, 300, 600, 1000];
         assert_eq!(chunk_size_pct(300, &cum, 0, 2), 50.0);
         assert_eq!(chunk_size_pct(200, &cum, 3, 3), 50.0);
-        // out of range or empty index disables the cap (returns 0)
         assert_eq!(chunk_size_pct(300, &cum, 0, 99), 0.0);
         assert_eq!(chunk_size_pct(300, &[], 0, 2), 0.0);
     }
 
     #[test]
     fn interpolate_hits_crossing() {
-        // vmaf 97 @ crf30, 93 @ crf40, target 95 -> 35
-        let pts = vec![p(30.0, 97.0, 0.0), p(40.0, 93.0, 0.0)];
-        assert!((interpolate_crf(&pts, 95.0) - 35.0).abs() < 1e-6);
+        // jod 9.7 @ crf30, 9.3 @ crf40, target 9.5 -> 35
+        let pts = vec![p(30.0, 9.7, 0.0), p(40.0, 9.3, 0.0)];
+        assert!((interpolate_crf(&pts, 9.5) - 35.0).abs() < 1e-6);
     }
 
     #[test]
     fn decide_picks_highest_crf_above_floor() {
-        // target 95, all under cap: highest CRF with vmaf >= 95 is 36
-        let pts = vec![p(30.0, 96.0, 50.0), p(32.0, 95.2, 45.0), p(36.0, 95.0, 40.0), p(40.0, 92.0, 35.0)];
-        let r = decide(&pts, 95.0, 90.0, 14.0);
+        // target 9.5, all under cap: highest CRF with jod >= 9.5 is 36
+        let pts = vec![p(30.0, 9.6, 50.0), p(32.0, 9.52, 45.0), p(36.0, 9.5, 40.0), p(40.0, 9.2, 35.0)];
+        let r = decide(&pts, 9.5, 90.0, 14.0);
         assert_eq!(r.crf, 36.0);
         assert!(matches!(r.outcome, SolveOutcome::Met));
     }
@@ -462,17 +504,17 @@ mod tests {
     #[test]
     fn decide_cap_binds_over_floor() {
         // floor CRF (20) is over the size cap; a higher CRF (25) is under it -> cap wins
-        let pts = vec![p(20.0, 96.0, 120.0), p(25.0, 93.0, 80.0)];
-        let r = decide(&pts, 95.0, 90.0, 14.0);
+        let pts = vec![p(20.0, 9.6, 120.0), p(25.0, 9.3, 80.0)];
+        let r = decide(&pts, 9.5, 90.0, 14.0);
         assert_eq!(r.crf, 25.0);
         assert!(matches!(r.outcome, SolveOutcome::CapBinding));
     }
 
     #[test]
     fn decide_floor_unreachable_uses_best_quality() {
-        // all below floor -> highest vmaf (crf 30)
-        let pts = vec![p(30.0, 90.0, 50.0), p(35.0, 88.0, 40.0), p(40.0, 85.0, 30.0)];
-        let r = decide(&pts, 95.0, 90.0, 14.0);
+        // all below floor -> highest jod (crf 30)
+        let pts = vec![p(30.0, 9.0, 50.0), p(35.0, 8.8, 40.0), p(40.0, 8.5, 30.0)];
+        let r = decide(&pts, 9.5, 90.0, 14.0);
         assert_eq!(r.crf, 30.0);
         assert!(matches!(r.outcome, SolveOutcome::FloorUnreachable));
     }
@@ -485,10 +527,8 @@ mod tests {
         };
         config.encoder_params.insert("crf".into(), toml::Value::Integer(28));
         assert_eq!(seed_crf(&config, 14.0, 45.0), 28.0);
-        // out of range clamps
         config.encoder_params.insert("crf".into(), toml::Value::Integer(60));
         assert_eq!(seed_crf(&config, 14.0, 45.0), 45.0);
-        // absent gives midpoint
         config.encoder_params.clear();
         assert_eq!(seed_crf(&config, 18.0, 44.0), 31.0);
     }

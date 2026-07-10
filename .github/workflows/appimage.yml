@@ -10,7 +10,7 @@ env:
   # Rolling-release repo: pin a main commit, bump via PR.
   SVT_AV1_HDR_REF: cfb4e17693ae16945a7fe288d45437243d96c12e
   FFMS2_VERSION: "5.0"
-  VMAF_VERSION: v3.2.0
+  VSHIP_VERSION: v5.0.2
   RUST_VERSION: 1.96.1
 
 # Least privilege by default; the appimage job opts into contents: write to attach release assets.
@@ -47,9 +47,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake meson ninja-build xxd nasm yasm git curl ca-certificates \
+            build-essential clang cmake nasm yasm git curl ca-certificates \
             pkg-config autoconf automake libtool \
             libavcodec-dev libavformat-dev libswscale-dev libavutil-dev libpostproc-dev \
+            libvulkan-dev \
             ffmpeg mkvtoolnix \
             file desktop-file-utils zsync \
             fuse libfuse2
@@ -102,22 +103,15 @@ jobs:
           sudo make install
           sudo ldconfig
 
-      - name: Build libvmaf
+      - name: Build Vship (FFVship, Vulkan backend)
         run: |
-          git clone --depth 1 --branch "$VMAF_VERSION" \
-            https://github.com/Netflix/vmaf.git /tmp/vmaf
-          cd /tmp/vmaf/libvmaf
-          meson setup build \
-            --buildtype=release \
-            --default-library=shared \
-            --libdir=lib \
-            -Dbuilt_in_models=true \
-            -Denable_tests=false \
-            -Denable_docs=false \
-            -Denable_float=true
-          ninja -C build
-          sudo ninja -C build install
-          sudo install -m755 build/tools/vmaf /usr/local/bin/vmaf
+          git clone --depth 1 --branch "$VSHIP_VERSION" \
+            https://codeberg.org/Line-fr/Vship.git /tmp/vship
+          cd /tmp/vship
+          make buildVulkan
+          PKG_CONFIG_PATH=/usr/local/lib/pkgconfig make buildFFVSHIP
+          sudo install -m755 FFVship /usr/local/bin/FFVship
+          sudo install -m755 libvship.so /usr/local/lib/libvship.so
           sudo ldconfig
 
       - name: Build avxs
@@ -138,10 +132,10 @@ jobs:
           cp "$(command -v ffmpeg)"           "$APPDIR/usr/bin/"
           cp "$(command -v ffprobe)"          "$APPDIR/usr/bin/"
           cp "$(command -v mkvmerge)"         "$APPDIR/usr/bin/"
-          cp /usr/local/bin/vmaf              "$APPDIR/usr/bin/"
+          cp /usr/local/bin/FFVship           "$APPDIR/usr/bin/"
 
           cp /usr/local/lib/libffms2.so*      "$APPDIR/usr/lib/"
-          cp /usr/local/lib/libvmaf.so*       "$APPDIR/usr/lib/"
+          cp /usr/local/lib/libvship.so       "$APPDIR/usr/lib/"
 
       - name: Build AppImage
         run: |

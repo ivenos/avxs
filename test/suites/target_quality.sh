@@ -1,11 +1,11 @@
 #!/bin/sh
-# Tests for target_quality: per-chunk VMAF-targeted CRF via the bundled vmaf tool.
+# Tests for target_quality: per-chunk CVVDP JOD-targeted CRF via the bundled FFVship tool.
 . "$(dirname "$0")/../lib.sh"
 
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
-# -- VMAF target: av1 output, model + chosen crf logged, tq.json cached ---------
+# -- CVVDP target: av1 output, display model + chosen crf logged, tq.json cached -
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -13,7 +13,7 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 [target_quality]
-vmaf       = 95
+jod        = 9.5
 min_crf    = 20
 max_crf    = 50
 max_probes = 3
@@ -34,7 +34,7 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 [target_quality]
-vmaf       = 90
+jod        = 9.0
 min_crf    = 20
 max_crf    = 50
 max_probes = 2

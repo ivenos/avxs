@@ -28,7 +28,10 @@ struct WorkerCtx {
     config: Arc<Config>,
     opts: Arc<EncodeOptions>,
     tq: Option<TargetQualityConfig>,
-    tq_model: Option<String>,
+    tq_display_model: Option<String>,
+    tq_gpu_id: Option<u32>,
+    source_width: u32,
+    source_height: u32,
     crf_cache: Option<Arc<CrfCache>>,
     threads_per_worker: usize,
     stem: String,
@@ -197,24 +200,25 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         tracing::info!("[{stem}] audio {line}");
     }
 
-    // Target quality: pick the VMAF model once (fails early if v1 is missing)
-    let output_height = encode_opts.scale.map(|(_, h)| h)
-        .or(encode_opts.crop.map(|c| c.h))
-        .unwrap_or(video_info.height);
-    let (tq_model, crf_cache): (Option<String>, Option<Arc<CrfCache>>) =
+    // Target quality: probe the metric tool once and pick the CVVDP display model.
+    // FFVship compares at the source resolution (a scaled-down encode is resized up to
+    // it), so the display model is keyed off the source/crop height, not the scaled output.
+    let reference_height = encode_opts.crop.map(|c| c.h).unwrap_or(video_info.height);
+    let (tq_display_model, tq_gpu_id, crf_cache): (Option<String>, Option<u32>, Option<Arc<CrfCache>>) =
         if let Some(tq) = &config.target_quality {
-            target_quality::ensure_available().await?;
-            let model = target_quality::model_for_height(output_height).to_string();
+            let gpu = target_quality::ensure_available().await?;
+            let hlg = target_quality::hdr_args_are_hlg(&encode_opts.hdr_args);
+            let display_model = target_quality::display_model_for(reference_height, config.avxs.hdr, hlg);
             tracing::info!(
-                "[{stem}] target quality: VMAF {} floor (model {model}, crf {}-{}, {}-{} probes, probe preset {}, max {}% size)",
-                tq.vmaf, tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset, tq.max_encoded_percent
+                "[{stem}] target quality: JOD {} floor (display {display_model}, {}, crf {}-{}, {}-{} probes, probe preset {}, max {}% size)",
+                tq.jod, gpu.describe(), tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset, tq.max_encoded_percent
             );
             if config.encoder_params.contains_key("crf") {
                 tracing::info!("[{stem}] target quality: crf in encoder_params used only as a probe seed");
             }
-            (Some(model), Some(Arc::new(CrfCache::load_or_create(&temp.tq_path)?)))
+            (Some(display_model.to_string()), Some(gpu.id), Some(Arc::new(CrfCache::load_or_create(&temp.tq_path)?)))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
     tracing::info!("[{stem}] encoding: {total_chunks} chunks, {num_workers} worker(s)");
@@ -239,7 +243,10 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         config: Arc::clone(&config),
         opts: Arc::clone(&encode_opts),
         tq: config.target_quality.clone(),
-        tq_model,
+        tq_display_model,
+        tq_gpu_id,
+        source_width: video_info.width,
+        source_height: video_info.height,
         crf_cache,
         threads_per_worker,
         stem: stem.to_owned(),
@@ -358,7 +365,8 @@ async fn finalize(
 /// Target-quality CRF for a chunk: cached value, else probe-and-solve (then cache it).
 /// Returns None when target quality is not active.
 async fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Option<f64>> {
-    let (Some(tq), Some(model), Some(cache)) = (&w.tq, &w.tq_model, &w.crf_cache) else {
+    let (Some(tq), Some(display_model), Some(gpu_id), Some(cache)) =
+        (&w.tq, &w.tq_display_model, &w.tq_gpu_id, &w.crf_cache) else {
         return Ok(None);
     };
     if let Some(c) = cache.get(chunk_key).await {
@@ -371,17 +379,21 @@ async fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Resu
     let temp_dir     = w.temp_dir.clone();
     let config       = Arc::clone(&w.config);
     let opts         = Arc::clone(&w.opts);
-    let tq           = tq.clone();
-    let model        = model.clone();
-    let scene        = scene.clone();
-    let stem         = w.stem.clone();
-    let n_threads    = w.threads_per_worker;
-    let byte_index   = Arc::clone(&w.source_byte_index);
+    let tq            = tq.clone();
+    let display_model = display_model.clone();
+    let gpu_id        = *gpu_id;
+    let source_width  = w.source_width;
+    let source_height = w.source_height;
+    let scene         = scene.clone();
+    let stem          = w.stem.clone();
+    let n_threads     = w.threads_per_worker;
+    let byte_index    = Arc::clone(&w.source_byte_index);
     let res = tokio::task::spawn_blocking(move || {
         let ctx = target_quality::ProbeContext {
             source: &source, index: &index, temp_dir: &temp_dir,
-            config: &config, opts: &opts, tq: &tq, model: &model, n_threads,
-            stem: &stem, source_byte_index: &byte_index,
+            config: &config, opts: &opts, tq: &tq,
+            display_model: &display_model, gpu_id, source_width, source_height,
+            n_threads, stem: &stem, source_byte_index: &byte_index,
         };
         target_quality::solve_chunk_crf(&ctx, &scene)
     })
@@ -391,16 +403,16 @@ async fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Resu
     cache.insert(chunk_key, res.crf).await?;
     match res.outcome {
         target_quality::SolveOutcome::Met => tracing::info!(
-            "[{}] chunk {chunk_key} target crf {} (VMAF {:.2}, {:.0}% size)",
-            w.stem, res.crf, res.vmaf, res.size_pct
+            "[{}] chunk {chunk_key} target crf {} (JOD {:.3}, {:.0}% size)",
+            w.stem, res.crf, res.jod, res.size_pct
         ),
         target_quality::SolveOutcome::CapBinding => tracing::warn!(
-            "[{}] chunk {chunk_key} crf {} capped by max_encoded_percent (VMAF {:.2} below floor, {:.0}% size)",
-            w.stem, res.crf, res.vmaf, res.size_pct
+            "[{}] chunk {chunk_key} crf {} capped by max_encoded_percent (JOD {:.3} below floor, {:.0}% size)",
+            w.stem, res.crf, res.jod, res.size_pct
         ),
         target_quality::SolveOutcome::FloorUnreachable => tracing::warn!(
-            "[{}] chunk {chunk_key} VMAF floor unreachable, using crf {} (VMAF {:.2})",
-            w.stem, res.crf, res.vmaf
+            "[{}] chunk {chunk_key} JOD floor unreachable, using crf {} (JOD {:.3})",
+            w.stem, res.crf, res.jod
         ),
     }
     Ok(Some(res.crf))
@@ -654,7 +666,7 @@ mod tests {
         assert_ne!(base, profile_fingerprint(&args, &o, &sc, None));
 
         // target_quality change -> different
-        let tq = crate::config::TargetQualityConfig { vmaf: 96.0, ..Default::default() };
+        let tq = crate::config::TargetQualityConfig { jod: 9.6, ..Default::default() };
         assert_ne!(base, profile_fingerprint(&args, &opts(), &sc, Some(&tq)));
     }
 }

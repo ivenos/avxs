@@ -55,9 +55,9 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
-      "matchStrings": ["ARG VMAF_VERSION=(?<currentValue>[^\\n]+)"],
-      "datasourceTemplate": "github-releases",
-      "depNameTemplate": "Netflix/vmaf",
+      "matchStrings": ["ARG VSHIP_VERSION=(?<currentValue>[^\\n]+)"],
+      "datasourceTemplate": "git-refs",
+      "depNameTemplate": "https://codeberg.org/Line-fr/Vship",
       "versioningTemplate": "semver"
     },
     {
@@ -95,9 +95,9 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
-      "matchStrings": ["VMAF_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
-      "datasourceTemplate": "github-releases",
-      "depNameTemplate": "Netflix/vmaf",
+      "matchStrings": ["VSHIP_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
+      "datasourceTemplate": "git-refs",
+      "depNameTemplate": "https://codeberg.org/Line-fr/Vship",
       "versioningTemplate": "semver"
     },
     {

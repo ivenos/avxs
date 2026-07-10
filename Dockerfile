@@ -4,7 +4,8 @@ ARG SVT_AV1_VERSION=v4.1.0
 # Rolling-release repo: pin a main commit, bump via PR.
 ARG SVT_AV1_HDR_REF=cfb4e17693ae16945a7fe288d45437243d96c12e
 ARG FFMS2_VERSION=5.0
-ARG VMAF_VERSION=v3.2.0
+# GPU metric tool (SSIMULACRA2/Butteraugli/CVVDP); Vulkan backend, drives target_quality.
+ARG VSHIP_VERSION=v5.0.2
 ARG RUST_VERSION=1.96.1
 
 FROM alpine:3.24 AS builder
@@ -12,18 +13,16 @@ FROM alpine:3.24 AS builder
 ARG SVT_AV1_VERSION
 ARG SVT_AV1_HDR_REF
 ARG FFMS2_VERSION
-ARG VMAF_VERSION
+ARG VSHIP_VERSION
 ARG RUST_VERSION
 ARG TARGETARCH
 
-# meson/ninja/xxd build libvmaf (xxd embeds the built-in models).
-# nasm/yasm are x86-only assemblers; SVT-AV1 and libvmaf use NEON on arm64 instead.
+# clang + vulkan-headers/loader build Vship's FFVship (Vulkan backend, no CUDA/HIP).
+# nasm/yasm are x86-only assemblers; SVT-AV1 uses NEON on arm64 instead.
 RUN apk add --no-cache \
         build-base \
+        clang \
         cmake \
-        meson \
-        ninja \
-        xxd \
         git \
         curl \
         pkgconf \
@@ -31,6 +30,8 @@ RUN apk add --no-cache \
         automake \
         libtool \
         ffmpeg-dev \
+        vulkan-headers \
+        vulkan-loader-dev \
         zlib-dev \
         ca-certificates && \
     [ "$TARGETARCH" != "amd64" ] || apk add --no-cache nasm yasm
@@ -76,22 +77,18 @@ RUN git clone --depth 1 --branch ${FFMS2_VERSION} \
     make install && \
     rm -rf /ffms2
 
-# Distro ffmpeg ships without libvmaf, so build libvmaf (v1 models built in) plus
-# its vmaf CLI; target_quality drives that tool directly.
-RUN git clone --depth 1 --branch ${VMAF_VERSION} \
-        https://github.com/Netflix/vmaf.git /vmaf && \
-    cd /vmaf/libvmaf && \
-    meson setup build \
-        --buildtype=release \
-        --default-library=shared \
-        -Dbuilt_in_models=true \
-        -Denable_tests=false \
-        -Denable_docs=false \
-        -Denable_float=true && \
-    ninja -C build && \
-    ninja -C build install && \
-    install -m755 build/tools/vmaf /usr/local/bin/vmaf && \
-    rm -rf /vmaf
+# Build Vship's FFVship CLI (GPU metric tool) with the Vulkan backend, so it runs on
+# NVIDIA/AMD/Intel and falls back to Mesa's llvmpipe (software Vulkan) with no GPU.
+# target_quality drives FFVship for the per-chunk CVVDP measurement. SPIR-V shaders
+# ship prebuilt in the repo, so no slangc/glslang is needed at build time.
+RUN git clone --depth 1 --branch ${VSHIP_VERSION} \
+        https://codeberg.org/Line-fr/Vship.git /vship && \
+    cd /vship && \
+    make buildVulkan && \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig make buildFFVSHIP && \
+    install -m755 FFVship /usr/local/bin/FFVship && \
+    install -m755 libvship.so /usr/local/lib/libvship.so && \
+    rm -rf /vship
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -107,11 +104,18 @@ RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETAR
 
 FROM alpine:3.24 AS runtime
 
+ARG TARGETARCH
+
+# vulkan-loader + Mesa ICDs: llvmpipe (swrast) is the no-GPU CPU fallback (also used
+# in CI); intel/ati cover those GPUs on amd64. NVIDIA is injected by the host toolkit.
 RUN apk add --no-cache \
         ffmpeg \
         mkvtoolnix \
         libstdc++ \
-        libgcc
+        libgcc \
+        vulkan-loader \
+        mesa-vulkan-swrast && \
+    [ "$TARGETARCH" != "amd64" ] || apk add --no-cache mesa-vulkan-intel mesa-vulkan-ati
 
 COPY --from=builder /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1EncApp
 COPY --from=builder /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
@@ -119,9 +123,9 @@ COPY --from=builder /usr/local/bin/ffmsindex         /usr/local/bin/ffmsindex
 COPY --from=builder /avxs                             /usr/local/bin/avxs
 # libffms2.so is not in Alpine's package manager - copy from builder
 COPY --from=builder /usr/local/lib/libffms2.so*      /usr/local/lib/
-# vmaf CLI + libvmaf (with v1 models) for target_quality
-COPY --from=builder /usr/local/bin/vmaf              /usr/local/bin/vmaf
-COPY --from=builder /usr/local/lib/libvmaf.so*       /usr/local/lib/
+# FFVship (GPU metric tool, Vulkan) + libvship for target_quality
+COPY --from=builder /usr/local/bin/FFVship           /usr/local/bin/FFVship
+COPY --from=builder /usr/local/lib/libvship.so       /usr/local/lib/
 # Add /usr/local/lib to musl dynamic linker search path (filename is arch-specific)
 RUN printf '/lib\n/usr/lib\n/usr/local/lib\n' > /etc/ld-musl-$(uname -m).path
 

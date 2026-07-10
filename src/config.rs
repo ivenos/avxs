@@ -16,7 +16,7 @@ pub struct Config {
     pub subtitles: SubtitleConfig,
     #[serde(default)]
     pub scene_detection: SceneDetectionConfig,
-    /// Per-chunk VMAF target instead of a fixed CRF. None = fixed CRF.
+    /// Per-chunk CVVDP JOD target instead of a fixed CRF. None = fixed CRF.
     pub target_quality: Option<TargetQualityConfig>,
 }
 
@@ -239,8 +239,8 @@ impl SceneDetectionConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct TargetQualityConfig {
-    /// VMAF score to hold as a hard minimum per chunk. 0 is rejected by validate().
-    pub vmaf: f64,
+    /// CVVDP JOD score to hold as a hard minimum per chunk. 0 is rejected by validate().
+    pub jod: f64,
     /// CRF search bounds.
     pub min_crf: u32,
     pub max_crf: u32,
@@ -257,9 +257,9 @@ pub struct TargetQualityConfig {
 impl Default for TargetQualityConfig {
     fn default() -> Self {
         Self {
-            vmaf: 0.0,
-            min_crf: 14,
-            max_crf: 45,
+            jod: 0.0,
+            min_crf: 1,
+            max_crf: 70,
             min_probes: 2,
             max_probes: 7,
             tolerance: 0.5,
@@ -292,8 +292,11 @@ impl Config {
             if self.avxs.video == VideoMode::Copy {
                 bail!("target_quality requires avxs.video = \"encode\"");
             }
-            if !(tq.vmaf > 0.0 && tq.vmaf <= 100.0) {
-                bail!("target_quality.vmaf must be in (0, 100] (got {})", tq.vmaf);
+            if !(tq.jod > 0.0 && tq.jod <= 10.0) {
+                bail!("target_quality.jod must be in (0, 10] (got {})", tq.jod);
+            }
+            if tq.min_crf < 1 {
+                bail!("target_quality.min_crf must be >= 1 (got {})", tq.min_crf);
             }
             if tq.min_crf >= tq.max_crf {
                 bail!("target_quality.min_crf must be < max_crf ({} >= {})", tq.min_crf, tq.max_crf);
@@ -471,24 +474,25 @@ mod tests {
 
     #[test]
     fn target_quality_defaults_and_valid() {
-        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95").unwrap();
+        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[target_quality]\njod = 9.5").unwrap();
         c.validate().unwrap();
         let tq = c.target_quality.unwrap();
-        assert_eq!((tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset), (14, 45, 2, 7, 13));
+        assert_eq!((tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset), (1, 70, 2, 7, 13));
         assert_eq!((tq.tolerance, tq.max_encoded_percent), (0.5, 90.0));
     }
 
     #[test]
     fn target_quality_rejects_bad_values() {
         let bad = [
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 0",
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 101",
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmin_crf = 40\nmax_crf = 30",
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmax_crf = 71",
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmin_probes = 1",
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmin_probes = 5\nmax_probes = 3",
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nprobe_preset = 14",
-            "encoder = \"svt-av1\"\n[target_quality]\nvmaf = 95\nmax_encoded_percent = 0",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 0",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 11",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmin_crf = 40\nmax_crf = 30",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmin_crf = 0",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmax_crf = 71",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmin_probes = 1",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmin_probes = 5\nmax_probes = 3",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nprobe_preset = 14",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmax_encoded_percent = 0",
         ];
         for t in bad {
             let c: Config = toml::from_str(t).unwrap();
@@ -499,7 +503,7 @@ mod tests {
     #[test]
     fn target_quality_requires_encode_video() {
         let c: Config = toml::from_str(
-            "encoder = \"svt-av1\"\n[avxs]\nvideo = \"copy\"\n[target_quality]\nvmaf = 95",
+            "encoder = \"svt-av1\"\n[avxs]\nvideo = \"copy\"\n[target_quality]\njod = 9.5",
         )
         .unwrap();
         assert!(c.validate().is_err());
