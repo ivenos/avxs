@@ -4,7 +4,6 @@ ARG SVT_AV1_VERSION=v4.1.0
 # Rolling-release repo: pin a main commit, bump via PR.
 ARG SVT_AV1_HDR_REF=cfb4e17693ae16945a7fe288d45437243d96c12e
 ARG FFMS2_VERSION=5.0
-# GPU metric tool (SSIMULACRA2/Butteraugli/CVVDP); Vulkan backend, drives target_quality.
 ARG VSHIP_VERSION=v5.0.2
 ARG RUST_VERSION=1.96.1
 
@@ -77,10 +76,6 @@ RUN git clone --depth 1 --branch ${FFMS2_VERSION} \
     make install && \
     rm -rf /ffms2
 
-# Build Vship's FFVship CLI (GPU metric tool) with the Vulkan backend, so it runs on
-# NVIDIA/AMD/Intel and falls back to Mesa's llvmpipe (software Vulkan) with no GPU.
-# target_quality drives FFVship for the per-chunk CVVDP measurement. SPIR-V shaders
-# ship prebuilt in the repo, so no slangc/glslang is needed at build time.
 RUN git clone --depth 1 --branch ${VSHIP_VERSION} \
         https://codeberg.org/Line-fr/Vship.git /vship && \
     cd /vship && \
@@ -106,8 +101,6 @@ FROM alpine:3.24 AS runtime
 
 ARG TARGETARCH
 
-# vulkan-loader + Mesa ICDs: llvmpipe (swrast) is the no-GPU CPU fallback (also used
-# in CI); intel/ati cover those GPUs on amd64. NVIDIA is injected by the host toolkit.
 RUN apk add --no-cache \
         ffmpeg \
         mkvtoolnix \

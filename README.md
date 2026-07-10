@@ -14,7 +14,7 @@ It is built to run unattended. Encodes resume from the last finished chunk after
 
 - **Scene-based parallel encoding** - cuts each file into scenes with [av-scenechange](https://github.com/rust-av/av-scenechange) and encodes the chunks in parallel.
 - **Resumable** - finished chunks are recorded, so a crash or restart continues where it left off.
-- **Target quality (CVVDP)** - probes each chunk at a few CRF values, measures [CVVDP](https://codeberg.org/Line-fr/Vship) (ColorVideoVDP, in JOD) against the source, and encodes at the CRF that hits the target. GPU-accelerated via Vulkan, with a CPU fallback when no GPU is present.
+- **Target quality (CVVDP)** - probes each chunk at a few CRF values, measures [CVVDP](https://codeberg.org/Line-fr/Vship) (ColorVideoVDP, in JOD) against the source, and encodes at the CRF that hits the target. GPU-accelerated via Vulkan (NVIDIA/AMD/Intel); a GPU is required.
 - **HDR passthrough** - detects HDR10, HLG, Dolby Vision and HDR10+ and passes the color metadata to the encoder; Dolby Vision and HDR10+ fall back to HDR10.
 - **Auto-crop** - removes black bars (ffmpeg `cropdetect`) before scaling.
 - **Auto-scale** - downscales to a target height with Lanczos, aspect ratio preserved; smaller sources are left untouched.
@@ -71,7 +71,7 @@ services:
     restart: unless-stopped
 ```
 
-For GPU-accelerated target quality (CVVDP), give the container access to a GPU. For Intel or AMD, add the render device to the service (`devices: ["/dev/dri:/dev/dri"]`); the image bundles the Mesa Vulkan drivers. For NVIDIA, install the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) and add a GPU reservation (`deploy.resources.reservations.devices`) or run with `--gpus all`. Without a GPU, target quality still runs on the CPU (software Vulkan), only slower; the other pipeline steps never need a GPU.
+Target quality (CVVDP) requires a GPU. For Intel or AMD, add the render device to the service (`devices: ["/dev/dri:/dev/dri"]`); the image bundles the Mesa Vulkan drivers. For NVIDIA, install the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) and add a GPU reservation (`deploy.resources.reservations.devices`) or run with `--gpus all`. Without a GPU, target quality fails with a clear error; the other pipeline steps never need a GPU.
 
 ### 2. AppImage
 
@@ -163,7 +163,7 @@ The search is an interpolated binary search on the encoder's 0.25 CRF grid: it i
 
 CVVDP is measured by [FFVship](https://codeberg.org/Line-fr/Vship), which reads the source and the probe directly and compares over the same frames, with the source cropped to match the encode; a scaled-down encode is resized back up to the source resolution for the comparison. The CVVDP display model is selected automatically from the source resolution: `standard_hdr_hlg` or `standard_hdr_pq` for HDR (by transfer), otherwise `standard_4k` at 1440p and above and `standard_fhd` below.
 
-FFVship runs on the GPU through Vulkan and picks the first hardware device it finds; with no GPU it falls back to Mesa's llvmpipe (software Vulkan) on the CPU, which produces the same scores but is slower. Device selection and the fallback are automatic; see [Docker](#1-docker) for granting GPU access.
+FFVship runs on the GPU through Vulkan and picks the first hardware device it finds automatically. A GPU is required: on a host without one, target quality fails with a clear error (CVVDP on the CPU is too slow to be practical). See [Docker](#1-docker) for granting GPU access.
 
 `crf` in `[encoder_params]` is ignored while target quality is active (it is used only as the first probe seed). Solved CRFs are cached, so a resume does not re-probe.
 

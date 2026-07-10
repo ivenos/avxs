@@ -36,43 +36,56 @@ pub fn hdr_args_are_hlg(hdr_args: &[String]) -> bool {
     hdr_args.windows(2).any(|w| w[0] == "--transfer-characteristics" && w[1] == "18")
 }
 
-/// A Vulkan device picked by FFVship for the metric run.
+/// A Vulkan device reported by FFVship.
 #[derive(Clone, Debug)]
 pub struct GpuSelection {
     pub id: u32,
     pub label: String,
-    /// False when the device is a software rasterizer (llvmpipe): the CPU fallback.
+    /// False for a software rasterizer (llvmpipe); target_quality rejects those.
     pub hardware: bool,
 }
 
 impl GpuSelection {
     pub fn describe(&self) -> String {
-        if self.hardware {
-            format!("gpu {} {}", self.id, self.label)
-        } else {
-            format!("gpu {} {} (software/CPU fallback)", self.id, self.label)
-        }
+        format!("gpu {} {}", self.id, self.label)
     }
 }
 
-/// Confirms FFVship runs and picks a Vulkan device: the first hardware GPU, or the
-/// software rasterizer (llvmpipe) as a CPU fallback when no GPU is present.
+/// Confirms FFVship runs and a hardware GPU is available. target_quality needs a GPU;
+/// a software-only Vulkan device (llvmpipe) or none is rejected with a clear error,
+/// because CVVDP on the CPU is far too slow to be practical.
 pub async fn ensure_available() -> Result<GpuSelection> {
     let out = tokio::process::Command::new(external_bin("FFVship"))
         .arg("--list-gpu")
         .output()
         .await
         .context("run FFVship --list-gpu (is the FFVship tool bundled?)")?;
+    // With no usable Vulkan driver at all, FFVship aborts creating the instance.
     if !out.status.success() {
-        bail!("FFVship is not runnable: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "target_quality requires a GPU, but FFVship could not initialize Vulkan:\n{}\n\
+             Provide a GPU (Intel/AMD: pass the render device /dev/dri; NVIDIA: nvidia-container-toolkit).",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    select_gpu(&text)
-        .ok_or_else(|| anyhow!("FFVship --list-gpu reported no Vulkan device:\n{}", text.trim()))
+    match select_gpu(&text) {
+        Some(g) if g.hardware => Ok(g),
+        Some(g) => bail!(
+            "target_quality requires a GPU, but FFVship found only a software Vulkan device ({}). \
+             Provide a GPU (Intel/AMD: pass the render device /dev/dri; NVIDIA: nvidia-container-toolkit), \
+             or remove [target_quality].",
+            g.label
+        ),
+        None => bail!(
+            "target_quality requires a GPU, but FFVship found no Vulkan device. \
+             Provide a GPU (Intel/AMD: pass the render device /dev/dri; NVIDIA: nvidia-container-toolkit)."
+        ),
+    }
 }
 
-/// Parses `FFVship --list-gpu` ("GPU <id>: <name>") and picks the first hardware
-/// device, falling back to the first software device (llvmpipe) as the CPU path.
+/// Parses `FFVship --list-gpu` ("GPU <id>: <name>") and returns the first hardware
+/// device, else the first software device (llvmpipe) so callers can tell them apart.
 fn select_gpu(list: &str) -> Option<GpuSelection> {
     let mut devices: Vec<GpuSelection> = Vec::new();
     for line in list.lines() {
@@ -455,7 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn select_gpu_falls_back_to_software() {
+    fn select_gpu_reports_software_only() {
+        // software-only is detected (hardware=false); ensure_available then rejects it
         let g = select_gpu("GPU 0: llvmpipe (LLVM 22.1.7)\n").unwrap();
         assert_eq!(g.id, 0);
         assert!(!g.hardware);
