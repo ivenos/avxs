@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG SVT_AV1_VERSION=v4.1.0
+ARG SVT_AV1_VERSION=v4.2.0
 # Rolling-release repo: pin a main commit, bump via PR.
 ARG SVT_AV1_HDR_REF=cfb4e17693ae16945a7fe288d45437243d96c12e
 ARG FFMS2_VERSION=5.0
