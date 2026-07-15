@@ -3,7 +3,7 @@
 [![Docker Image Size](https://img.shields.io/docker/image-size/ivenos/avxs)](https://hub.docker.com/r/ivenos/avxs)
 [![Docker Pulls](https://img.shields.io/docker/pulls/ivenos/avxs)](https://hub.docker.com/r/ivenos/avxs)
 [![License](https://img.shields.io/badge/license-BSL_1.1-orange)](https://github.com/ivenos/avxs/blob/main/LICENSE)
-[![svt-av1](https://img.shields.io/badge/svt--av1-v4.1.0-purple)](https://gitlab.com/AOMediaCodec/SVT-AV1)
+[![svt-av1](https://img.shields.io/badge/svt--av1-v4.2.0-purple)](https://gitlab.com/AOMediaCodec/SVT-AV1)
 [![svt-av1-hdr](https://img.shields.io/badge/svt--av1--hdr-cfb4e17-purple)](https://github.com/juliobbv-p/svt-av1-hdr) <!-- renovate: juliobbv-p/svt-av1-hdr@cfb4e17693ae16945a7fe288d45437243d96c12e -->
 
 **avxs** is an AV1 encoding service written in Rust, distributed as a Docker image and a self-contained Linux AppImage. Drop video files and an `encode.toml` profile into a folder; avxs picks them up, splits each file into scenes, encodes the chunks in parallel with SVT-AV1, and merges everything back into a finished MKV. It runs as a daemon: point it at an input and an output directory and it keeps watching for new work.
