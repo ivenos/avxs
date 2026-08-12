@@ -166,9 +166,11 @@ toolchain - exist twice, as `ARG`s in the `Dockerfile` and as `env` in
 `.github/workflows/appimage.yml`. Renovate groups both into one PR as long as
 the two agree, so keep them in lockstep: let them drift and the image and the
 AppImage ship different encoders. SVT-AV1-HDR is a rolling repo and is pinned to
-a commit rather than a tag. FFmpeg is pinned in `appimage.yml` alone, since the
-image takes Alpine's package; keep the pin on the version Alpine ships, and note
-that Ubuntu's own is too old to build Vship against.
+a commit rather than a tag. FFmpeg is pinned in `appimage.yml` alone and is the
+one pin Renovate does not track: it has to follow the version Alpine gives the
+image, not the newest release, so move it by hand when the base image moves.
+Ubuntu's own ffmpeg is too old to build Vship against, which is why the AppImage
+builds its own.
 
 Base images and GitHub Actions stay on version tags, never commit SHAs or
 digests. linuxdeploy is pinned to a release tag rather than its rolling
