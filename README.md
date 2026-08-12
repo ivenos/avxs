@@ -6,18 +6,18 @@
 [![svt-av1](https://img.shields.io/badge/svt--av1-v4.2.0-purple)](https://gitlab.com/AOMediaCodec/SVT-AV1)
 [![svt-av1-hdr](https://img.shields.io/badge/svt--av1--hdr-cfb4e17-purple)](https://github.com/juliobbv-p/svt-av1-hdr) <!-- renovate: juliobbv-p/svt-av1-hdr@cfb4e17693ae16945a7fe288d45437243d96c12e -->
 
-**avxs** is an AV1 encoding service written in Rust, distributed as a Docker image and a self-contained Linux AppImage. Drop video files and an `encode.toml` profile into a folder; avxs picks them up, splits each file into scenes, encodes the chunks in parallel with SVT-AV1, and merges everything back into a finished MKV. It runs as a daemon: point it at an input and an output directory and it keeps watching for new work.
+**avxs** is an AV1 encoding service written in Rust, shipped as a Docker image and a self-contained Linux AppImage. Drop video files and an `encode.toml` profile into a folder; avxs splits each file into scenes, encodes the chunks in parallel with SVT-AV1, and merges them back into a finished MKV.
 
-It is built to run unattended. Encodes resume from the last finished chunk after a restart, audio and subtitles are carried over with per-track rules, and every external tool it needs is bundled, so there is nothing to install beside avxs itself.
+It runs unattended: encodes resume from the last finished chunk after a restart, audio and subtitles are carried over with per-track rules, and every external tool is bundled.
 
 ## Features
 
 - **Scene-based parallel encoding** - cuts each file into scenes with [av-scenechange](https://github.com/rust-av/av-scenechange) and encodes the chunks in parallel.
 - **Resumable** - finished chunks are recorded, so a crash or restart continues where it left off.
 - **Target quality (CVVDP)** - probes each chunk at a few CRF values, measures [CVVDP](https://codeberg.org/Line-fr/Vship) (ColorVideoVDP, in JOD) against the source, and encodes at the CRF that hits the target. GPU-accelerated via Vulkan (NVIDIA/AMD/Intel); a GPU is required.
-- **HDR passthrough** - detects HDR10, HLG, Dolby Vision and HDR10+ and passes the color metadata to the encoder; Dolby Vision and HDR10+ fall back to HDR10.
+- **HDR passthrough** - detects HDR10, HLG, Dolby Vision and HDR10+ and passes the color metadata to the encoder; HDR10+ and Dolby Vision profiles 7 and 8 fall back to their HDR10 base layer.
 - **Auto-crop** - removes black bars (ffmpeg `cropdetect`) before scaling.
-- **Auto-scale** - downscales to a target height with Lanczos, aspect ratio preserved; smaller sources are left untouched.
+- **Auto-scale** - downscales to a target height with Lanczos, aspect ratio kept within a pixel; smaller sources are left untouched.
 - **Auto-keyint** - derives `--keyint` from the source frame rate for a ~5 s keyframe interval.
 - **Audio control** - copy or re-encode per source codec, with a language whitelist, per-layout bitrates, and automatic lossless handling.
 - **Subtitle control** - copy or strip per language whitelist; chapters are always kept.
@@ -32,9 +32,11 @@ For every video next to an `encode.toml`, avxs runs this pipeline:
 3. **Encode chunks in parallel**, one SVT-AV1 process per worker; the number of workers is derived from CPU cores and free RAM.
 4. **Probe for target quality** (optional) - find the per-chunk CRF that hits the CVVDP (JOD) target.
 5. **Merge** the chunks, **process audio** (copy or re-encode per track), and **mux** video, audio, subtitles and chapters into the final MKV.
-6. **Validate** the output, move the source into `input/processed/`, and clean up temporary files.
+6. **Validate** the output, move the source into `input/processed/`, and clean up. An encode has to be readable *and* hold every frame the chunk list accounts for; one that ends early never reaches the output directory. An existing file in `processed/` is never overwritten - the archived copy gets a `.2`, `.3` suffix.
 
-Intermediate state (index, scene list, finished chunks, solved CRFs) lives in a hidden `.avxs_<name>/` directory under the output folder, which is what makes encodes resumable. If the encode profile changes between runs (encoder args, crop, scale, bit depth, scene detection), the cached scene list and chunks are discarded and the file is re-encoded.
+Intermediate state (index, scene list, finished chunks, solved CRFs) lives in a hidden `.avxs_<name>/` directory under the output folder, which is what makes encodes resumable. A changed profile (encoder args, crop, scale, bit depth, scene detection, target quality) discards the cached scenes, chunks and CRFs. The finished file is muxed inside that directory and only moved to its final name once it validates.
+
+The file name without its extension is the identity of a job: output, temp directory and the copy under `input/processed/` all carry it. Two queued files sharing one would overwrite each other, so neither runs until one is renamed.
 
 ## Table of contents
 
@@ -47,7 +49,7 @@ Intermediate state (index, scene list, finished chunks, solved CRFs) lives in a 
   - [`encoder`](#encoder)
   - [`[encoder_params]`](#encoder_params)
   - [`[target_quality]`](#target_quality)
-  - [`[avxs]`](#avxs)
+  - [`[avxs]`](#avxs-1)
   - [`[audio]`](#audio)
   - [`[audio.lossless]`](#audiolossless)
   - [`[audio.codec_rules]`](#audiocodec_rules)
@@ -63,6 +65,7 @@ Intermediate state (index, scene list, finished chunks, solved CRFs) lives in a 
 services:
   avxs:
     image: ivenos/avxs:latest
+    user: "1000:1000"
     volumes:
       - ./input:/input
       - ./output:/output
@@ -71,11 +74,13 @@ services:
     restart: unless-stopped
 ```
 
-Target quality (CVVDP) requires a GPU. For Intel or AMD, add the render device to the service (`devices: ["/dev/dri:/dev/dri"]`); the image bundles the Mesa Vulkan drivers. For NVIDIA, install the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) and add a GPU reservation (`deploy.resources.reservations.devices`) or run with `--gpus all`. Without a GPU, target quality fails with a clear error; the other pipeline steps never need a GPU.
+Without `user:` the container runs as root, and everything it writes ends up owned by root on the host.
+
+Target quality (CVVDP) requires a GPU; the other steps never need one. Intel or AMD: add `devices: ["/dev/dri:/dev/dri"]` and, with `user:` set, `group_add: ["render"]` - the amd64 image bundles the Mesa drivers. NVIDIA: install the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) and add a GPU reservation or run with `--gpus all`. The arm64 image ships no hardware Vulkan driver.
 
 ### 2. AppImage
 
-Grab the AppImage for your architecture from the [latest release](https://github.com/ivenos/avxs/releases/latest). By default avxs creates `./input/` and `./output/` next to its working directory and watches them. Override with the [environment variables](#environment-variables) below.
+Grab the AppImage for your architecture from the [latest release](https://github.com/ivenos/avxs/releases/latest). By default avxs creates `input/` and `output/` inside its working directory and watches them. Override with the [environment variables](#environment-variables) below.
 
 ## Directory layout
 
@@ -97,20 +102,30 @@ output/
 └── Another Film.mkv
 ```
 
-Supported input extensions: `mkv`, `mp4`, `mov`, `avi`, `ts`, `m2ts`, `flv`, `webm`, `m4v`. A file is skipped while it is still being written, and again once its output exists. If an encode fails permanently, a marker is written and the file is skipped until you remove it (the log explains how).
+Supported input extensions: `mkv`, `mp4`, `mov`, `avi`, `ts`, `m2ts`, `flv`, `webm`, `m4v`. A file whose output already exists is skipped, and so is a file whose name contains a line break or is not valid UTF-8. An empty file in the output directory does not count as an existing output: avxs never produces one, so it is a leftover and gets replaced.
+
+Only the first video track is encoded and reaches the output; `video = "copy"` passes every video track through unchanged.
+
+On `SIGTERM` or `SIGINT` avxs finishes the job it is on and then exits, rather than leaving its encoder processes running against files the next start would write to as well.
+
+A file that is still being copied in is waited on for up to five minutes; its size and timestamp have to hold still for three seconds. If it is still growing when the wait runs out, avxs gives up on it for this round and picks it up again on the next scan.
+
+The same goes for every failure that clears on its own: a profile that does not parse, a tool that hits its timeout, a full output volume, a GPU that is not up yet. Those are logged on every scan and nothing is marked. Only a failure a retry cannot fix writes a marker, and the file is then skipped until you delete it (the log gives the path). The marker records which file it was written for, so a later file with the same name is not caught by it.
 
 ## Environment variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `AVXS_INPUT_DIR` | `./input` | Input directory to watch |
-| `AVXS_OUTPUT_DIR` | `./output` | Output directory for finished files |
-| `AVXS_POLL_INTERVAL` | `60` | Directory scan interval in seconds |
-| `RUST_LOG` | `info` | Log verbosity. Set to `debug` for verbose output |
+| Variable | Default | Docker image | Description |
+|---|---|---|---|
+| `AVXS_INPUT_DIR` | `./input` | `/input` | Input directory to watch |
+| `AVXS_OUTPUT_DIR` | `./output` | `/output` | Output directory for finished files |
+| `AVXS_POLL_INTERVAL` | `60` | `60` | Directory scan interval in seconds |
+| `RUST_LOG` | `info` | not set | Log verbosity. Set to `debug` for verbose output |
+
+The second column is what the image sets itself; `RUST_LOG` it leaves alone, and the `info` default comes from avxs either way.
 
 ## Configuration
 
-Each profile folder contains an `encode.toml`. The only required key is `encoder` (unless you copy the video stream). Everything else has sensible defaults. The sections below document every key. A complete profile is shown in [Full example](#full-example).
+Each profile folder contains an `encode.toml`. The only required key is `encoder`, unless the video stream is copied; everything else has a default. Unknown keys are rejected rather than ignored, so a misspelled `[target_qualtiy]` fails the profile instead of quietly turning the feature off.
 
 ### `encoder`
 
@@ -137,9 +152,11 @@ crf    = 28
 
 Values may be strings, integers, floats, or booleans (booleans become `1`/`0`).
 
+Two keys are read by avxs as well as passed on. `crf` is used as the first probe seed when `[target_quality]` is active, and `lp` (SVT-AV1's logical processors per encode) is what avxs divides the CPU by to decide how many chunks to encode at once. Without `lp` it assumes `6`.
+
 ### `[target_quality]`
 
-Targets a CVVDP score per chunk instead of a fixed `crf`. CVVDP ([ColorVideoVDP](https://codeberg.org/Line-fr/Vship)) is a color- and motion-aware perceptual metric reported in JOD (Just-Objectionable-Differences) from 0 to 10, where 10 means no perceptible difference from the source. `jod` is a hard minimum: avxs probes each chunk at several CRF values, measures CVVDP against the source, and picks the highest CRF (lowest bitrate) whose JOD still holds that floor. Requires `avxs.video = "encode"`.
+Targets a CVVDP score per chunk instead of a fixed `crf`. CVVDP ([ColorVideoVDP](https://codeberg.org/Line-fr/Vship)) is a colour- and motion-aware perceptual metric in JOD (Just-Objectionable-Differences) from 0 to 10, where 10 means no perceptible difference from the source. `jod` is a hard minimum: avxs probes each chunk at several CRF values and picks the highest CRF whose JOD still holds it. Requires `avxs.video = "encode"`.
 
 ```toml
 [target_quality]
@@ -148,28 +165,30 @@ jod = 9.5
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `jod` | Float | - | Minimum CVVDP JOD to hold per chunk, in `(0, 10]` (required) |
+| `jod` | Float | - | Minimum CVVDP JOD to hold per chunk, in `(0, 10)` (required) |
 | `min_crf` | Integer | `1` | Lower bound of the CRF search |
 | `max_crf` | Integer | `70` | Upper bound of the CRF search (max `70`) |
-| `min_probes` | Integer | `2` | Minimum probe encodes per chunk |
+| `min_probes` | Integer | `2` | Number of probes before the `tolerance` early stop may fire |
 | `max_probes` | Integer | `7` | Maximum probe encodes per chunk |
 | `tolerance` | Float | `0.5` | Stop early when a probe lands at most this far above the floor (in JOD) |
 | `probe_preset` | Integer | `13` | SVT-AV1 preset for probe encodes (`13` = fastest) |
 | `max_encoded_percent` | Float | `90` | Chunk size ceiling as a percent of the source's bytes for that chunk |
 
-The search is an interpolated binary search on the encoder's 0.25 CRF grid: it interpolates between probes to estimate where JOD crosses the floor, then settles on the highest CRF that still holds it. It stops once a probe lands within `tolerance` above the floor, the crossing is narrowed to one 0.25 step, the probe budget is reached, or a CRF bound is hit. Probe encodes use `probe_preset`; the final encode uses the preset from `[encoder_params]`, so the final JOD tends to land above the probed value.
+The search interpolates between probes to estimate where JOD crosses the floor, on the encoder's 0.25 CRF grid. It stops once a probe lands within `tolerance` above the floor, the crossing is narrowed to one step, the budget is spent, or a bound is hit; `min_probes` gates only the `tolerance` stop. Probes use `probe_preset` while the final encode uses the preset from `[encoder_params]`, so the delivered JOD tends to land above the probed value.
 
-`max_encoded_percent` caps the bitrate: if holding the JOD floor would make a chunk larger than this percent of the source's own bytes for that chunk, a higher CRF is used instead and that chunk's JOD drops below the floor (logged as a warning). The source chunk size comes from one ffprobe pass over the video packets (no decoding). If the floor cannot be reached within `[min_crf, max_crf]`, `min_crf` is used (logged as a warning).
+`max_encoded_percent` is the harder of the two constraints: if holding the floor would make a chunk larger than this percent of the source's own bytes for those frames, a higher CRF is used and that chunk's JOD drops below the floor (logged as a warning). If no probe is under the cap, the remaining budget searches toward `max_crf` until one fits, then back down between that CRF and the highest one that did not. The source size comes from one ffprobe pass over the video packets; if it fails, the cap never binds.
 
-CVVDP is measured by [FFVship](https://codeberg.org/Line-fr/Vship), which reads the source and the probe directly and compares over the same frames, with the source cropped to match the encode; a scaled-down encode is resized back up to the source resolution for the comparison. The CVVDP display model is selected automatically from the source resolution: `standard_hdr_hlg` or `standard_hdr_pq` for HDR (by transfer), otherwise `standard_4k` at 1440p and above and `standard_fhd` below.
+If the floor cannot be reached anywhere in `[min_crf, max_crf]`, avxs uses the lowest CRF (best quality) that still fits the size cap, and logs a warning. It does not fall back to `min_crf` regardless of size.
 
-FFVship runs on the GPU through Vulkan and picks the first hardware device it finds automatically. A GPU is required: on a host without one, target quality fails with a clear error (CVVDP on the CPU is too slow to be practical). See [Docker](#1-docker) for granting GPU access.
+CVVDP is measured by [FFVship](https://codeberg.org/Line-fr/Vship), which compares source and probe over the same frames with the source cropped to match; a scaled-down encode is resized back up for the comparison. The display model follows `avxs.hdr`: `standard_hdr_hlg` or `standard_hdr_pq` by the signalled transfer, otherwise `standard_4k` from 1440p up and `standard_fhd` below, measured after the crop.
+
+FFVship runs on Vulkan and picks the first hardware device it finds. Without one the job fails with a clear error - CVVDP on the CPU is too slow to be practical. See [Docker](#1-docker) for granting access.
 
 `crf` in `[encoder_params]` is ignored while target quality is active (it is used only as the first probe seed). Solved CRFs are cached, so a resume does not re-probe.
 
 ### `[avxs]`
 
-avxs pipeline controls. All flags default to `false` / disabled.
+avxs pipeline controls. Every boolean here defaults to `false`; `video` defaults to `"encode"`.
 
 ```toml
 [avxs]
@@ -184,10 +203,10 @@ keep_temp = false
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `video` | `"encode"` \| `"copy"` | `"encode"` | `copy` passes the source video through untouched and only runs the audio and subtitle steps. The video-only options below and `[encoder_params]` are ignored, and `encoder` is not needed. |
-| `hdr` | Boolean | `false` | Detect HDR type and pass color metadata (`--color-primaries`, `--transfer-characteristics`, `--matrix-coefficients`, `--chroma-sample-position`, `--content-light`, `--mastering-display`) to the encoder automatically. Works for HDR10, HLG, and Dolby Vision/HDR10+ (fallback to HDR10 metadata). Independent of the encoder binary chosen. |
-| `crop` | Boolean | `false` | Detect black bars via `ffmpeg cropdetect` (5 samples at 10/25/40/55/70 % of the runtime, threshold 128 for HDR/10-bit). The detected crop is applied in the Y4M pipe **before** the encoder. Result is cached in the temp directory. |
-| `keyint` | Boolean | `false` | Calculate `--keyint` from source FPS for a ~5 s keyframe distance (`round(fps x 5)`). Silently skipped if `keyint` is already set in `[encoder_params]`. |
-| `scale` | Integer | - | Maximum output height in pixels. The source is scaled down proportionally with Lanczos if taller than this. If the source (after crop) is already at or below this height, no scaling is applied. Example: `1080` encodes 4K content as 1080p while leaving 720p untouched. Aspect ratio is always preserved. |
+| `hdr` | Boolean | `false` | Detect HDR type and pass color metadata (`--color-primaries`, `--transfer-characteristics`, `--matrix-coefficients`, `--chroma-sample-position`, `--color-range`, `--content-light`, `--mastering-display`) to the encoder automatically. Works for HDR10, HLG, HDR10+ and Dolby Vision profiles 7 and 8, which keep their HDR10 base layer. Dolby Vision profile 5 is refused: it has no HDR10 base layer, so an encode of it would have badly wrong colours. Independent of the encoder binary chosen. |
+| `crop` | Boolean | `false` | Detect black bars via `ffmpeg cropdetect`: 5 samples of 10 s at 10/25/40/55/70 % of the runtime, threshold 24/255 scaled to the source's bit depth, edges rounded to even. The samples are combined into the rectangle containing all of them, and the crop is ignored unless it removes more than 1 % of the pixels. One that would cut away more than 60 % counts as a misdetection, since cropdetect boxes what is not black and an all-dark scene boxes only the lit part. Applied in the Y4M pipe **before** the encoder, and cached in the temp directory unless it failed or was rejected. |
+| `keyint` | Boolean | `false` | Calculate `--keyint` from source FPS for a ~5 s keyframe distance (`round(fps x 5)`). Silently skipped if `keyint` is already set in `[encoder_params]`. SVT-AV1's own default (`--keyint -2`) also aims at roughly 5 s, so this mainly makes the value explicit and independent of the encoder. |
+| `scale` | Integer | - | Maximum output height in pixels, at least `64`. The source is scaled down proportionally with Lanczos if taller than this. If the source (after crop) is already at or below this height, no scaling is applied. Example: `1080` encodes 4K content as 1080p while leaving 720p untouched. Both edges are rounded down to an even number, so the aspect ratio is held to within a pixel rather than exactly. |
 | `bit_depth` | `8` \| `10` | - | Force the encoder input bit depth. Omitted passes the source depth through (8-bit stays 8, 10-bit stays 10); sources deeper than 10-bit are clamped to 10-bit, since SVT-AV1 accepts only 8/10-bit input. Set to `10` to convert 8-bit sources to 10-bit before encoding. |
 | `keep_temp` | Boolean | `false` | Keep temporary chunks and index files after encoding. |
 
@@ -207,7 +226,7 @@ bitrate = { stereo = "192k", "5.1" = "320k", "7.1" = "512k", default = "192k" }
 | `mode` | `"copy"` \| `"encode"` | `"copy"` | Copy or re-encode |
 | `codec` | String | - | ffmpeg codec name, e.g. `"libopus"`. Required when `mode = "encode"` |
 | `bitrate` | String \| table | - | Target bitrate, single value or per-layout table (see below). Required when encoding to a lossy codec |
-| `options` | table | `{}` | Extra encoder options, passed as `-<key> <value>`, e.g. `{ compression_level = 12 }` |
+| `options` | table | `{}` | Extra encoder options, passed per output track as `-<key>:a:<index> <value>`, e.g. `{ compression_level = 12 }`. Global ffmpeg options do not work here |
 | `language_whitelist` | String array | `[]` | Keep only tracks with these language tags (ISO 639-2). Empty = keep all |
 
 The channel count is always taken from the source. FLAC passes the source layout through unchanged; Opus normalizes the layout name to one its encoder accepts but never changes the channel count.
@@ -221,9 +240,9 @@ The channel count is always taken from the source. FLAC passes the source layout
 | 3 | `3.0` | 7 | `6.1` |
 | 4 | `quad` | 8 | `7.1` |
 
-Lossless codecs (`flac`, `alac`, `wavpack`, `pcm_*`) ignore bitrate, so it may be omitted for them.
+Lossless codecs (`flac`, `alac`, `wavpack`, `tta`, `pcm_*`) ignore bitrate, so it may be omitted for them.
 
-**Language whitelist.** When set, only audio tracks whose language tag is in the list are kept. Tracks **without** a language tag are always kept.
+**Language whitelist.** When set, only audio tracks whose language tag is in the list are kept. Tracks **without** a language tag are always kept, including those tagged `und`: Matroska omits the field where MP4 and MPEG-TS write `und`, and both mean the same thing.
 
 ```toml
 [audio]
@@ -231,20 +250,24 @@ language_whitelist = ["eng"]  # English only
 mode = "copy"
 ```
 
-Common ISO 639-2 codes: `eng` (English), `deu`/`ger` (German), `fra`/`fre` (French), `jpn` (Japanese), `und` (undefined).
+Matching is case-insensitive and covers both ISO 639-2 spellings, so `deu` also matches a track tagged `ger` - which avxs' own output carries, since Matroska stores the bibliographic form. Region and script subtags are ignored on both sides. The two code sets do not mix: `por` does not match `pt-BR`, and `de-DE` does not match `ger`.
 
-**Track titles.** Re-encoded tracks keep their source name with the new codec appended, e.g. `English Dolby Digital Plus 7.1` becomes `English Dolby Digital Plus 7.1 (Opus)`. Untitled tracks get the codec name alone; copied tracks keep their name. Before encoding, avxs logs one line per kept track:
+Common ISO 639-2 codes: `eng` (English), `deu`/`ger` (German), `fra`/`fre` (French), `jpn` (Japanese). Listing `und` has no effect, since untagged tracks are kept regardless.
+
+The same whitelist rules apply to `[subtitles]`.
+
+**Track titles.** Re-encoded tracks keep their source name with the new codec appended: `English Dolby Digital Plus 7.1 (Opus)`. The marker does not stack when an avxs output is re-encoded. Untitled tracks get the codec name alone, copied tracks keep theirs. Dispositions (default, forced, commentary, hearing- and visual-impaired, original) come from the source. One log line per kept track:
 
 ```
-audio track 0: eng eac3 5.1 (lossy) -> Opus 320k
-audio track 1: eng truehd 7.1 (lossless) -> FLAC
+[The Movie (2021)] audio track 0: eng eac3 5.1 (lossy) -> Opus 320k
+[The Movie (2021)] audio track 1: eng truehd 7.1 (lossless) -> FLAC
 ```
 
 ### `[audio.lossless]`
 
-Override applied to tracks whose **source** is lossless. Any field left unset inherits from `[audio]`, so you usually only set `codec` and maybe `options`.
+Override for tracks whose **source** is lossless. Unset fields inherit from `[audio]`, except `options`: a non-empty table replaces the inherited one rather than merging into it.
 
-Lossless is detected from ffmpeg's own codec table (`ffmpeg -codecs`), so every codec ffmpeg flags as lossless is covered. `dts` is special-cased: it counts as lossless only in its Master Audio profile (`DTS-HD MA`), since ffprobe reports lossy and lossless DTS under the same codec name.
+Lossless comes from ffmpeg's own codec table (`ffmpeg -codecs`). `dts` is special-cased and counts as lossless only in its Master Audio profile, since ffprobe reports both under the same codec name.
 
 ```toml
 [audio]
@@ -297,7 +320,7 @@ language_whitelist = ["eng", "jpn"]  # English and Japanese only
 | `mode` | `"copy"` \| `"strip"` | `"copy"` | `copy` keeps subtitle tracks; `strip` removes them all |
 | `language_whitelist` | String array | `[]` | Keep only tracks with these language tags (ISO 639-2). Empty = keep all |
 
-When the whitelist is set, only subtitle tracks whose language tag is in the list are kept. Tracks **without** a language tag are always kept. To remove every subtitle:
+When the whitelist is set, only subtitle tracks whose language tag is in the list are kept. Tracks **without** a language tag are always kept, `und` included. To remove every subtitle:
 
 ```toml
 [subtitles]
@@ -317,11 +340,11 @@ extra_split_sec = 10
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `min_scene_len` | Integer | `24` | Minimum chunk length in frames. Cuts closer than this are suppressed. |
+| `min_scene_len` | Integer | `24` | Minimum chunk length in frames (min `1`). Cuts closer than this are suppressed. |
 | `extra_split_sec` | Integer | `10` | Maximum chunk length in seconds. Longer chunks are split into roughly equal parts. Set to `0` to disable. Ignored when `extra_split` > 0. |
-| `extra_split` | Integer | `0` | Maximum chunk length in frames. Overrides `extra_split_sec` when > 0. Set to `0` to use `extra_split_sec` instead. |
+| `extra_split` | Integer | `0` | Maximum chunk length in frames (min `24` when set). Overrides `extra_split_sec` when > 0. Set to `0` to use `extra_split_sec` instead. |
 | `speed` | `"standard"` \| `"fast"` | `"standard"` | Detection algorithm. `standard` uses SATD-based motion estimation. `fast` uses raw pixel differences, which lowers detection time and accuracy. |
-| `downscale_height` | Integer | - | Downscale to this height (e.g. `720`) for scene detection only. Does not affect encoding output. Speeds up detection on high-resolution sources at some accuracy cost. |
+| `downscale_height` | Integer | - | Downscale to this height (e.g. `720`, min `64`) for scene detection only. Does not affect encoding output. Speeds up detection on high-resolution sources at some accuracy cost. |
 
 ### Full example
 
