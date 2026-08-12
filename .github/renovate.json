@@ -95,6 +95,14 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
+      "matchStrings": ["FFMPEG_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "FFmpeg/FFmpeg",
+      "versioningTemplate": "regex:^n(?<major>\\d+)\\.(?<minor>\\d+)(\\.(?<patch>\\d+))?$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
       "matchStrings": ["VSHIP_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
       "datasourceTemplate": "git-refs",
       "depNameTemplate": "https://codeberg.org/Line-fr/Vship",

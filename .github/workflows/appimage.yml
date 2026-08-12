@@ -1,15 +1,27 @@
 name: AppImage
 
+# Also on changes to this file: the pinned tool versions live here, and a bump that
+# breaks the build would otherwise surface at the next release and nowhere else.
 on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for the artifact names, e.g. v1.0.0. Empty uses dev-<sha>."
+        required: false
+  pull_request:
+    paths: [".github/workflows/appimage.yml"]
+  push:
+    branches: [main]
+    paths: [".github/workflows/appimage.yml"]
 
 env:
   SVT_AV1_VERSION: v4.2.0
   # Rolling-release repo: pin a main commit, bump via PR.
   SVT_AV1_HDR_REF: cfb4e17693ae16945a7fe288d45437243d96c12e
   FFMS2_VERSION: "5.0"
+  FFMPEG_VERSION: n8.1.2
   VSHIP_VERSION: v5.1.0
   RUST_VERSION: 1.97.1
   LINUXDEPLOY_VERSION: 1-alpha-20251107-1
@@ -62,20 +74,22 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Resolve version
-        # Not interpolated: a tag name is attacker-chosen text and this writes $GITHUB_ENV.
+        # Not interpolated: both are attacker-chosen text and this writes $GITHUB_ENV.
         env:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -eu
           if [ "$EVENT_NAME" = "release" ]; then
-            case "$RELEASE_TAG" in
-              *[!A-Za-z0-9._-]*|"") echo "::error::refusing unusual tag name"; exit 1 ;;
-            esac
-            echo "AVXS_VERSION=$RELEASE_TAG" >> "$GITHUB_ENV"
+            VERSION="$RELEASE_TAG"
           else
-            echo "AVXS_VERSION=dev-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+            VERSION="${INPUT_VERSION:-dev-${GITHUB_SHA:0:7}}"
           fi
+          case "$VERSION" in
+            *[!A-Za-z0-9._-]*|"") echo "::error::refusing unusual version name"; exit 1 ;;
+          esac
+          echo "AVXS_VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -83,9 +97,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential clang cmake nasm yasm git curl ca-certificates \
             pkg-config autoconf automake libtool \
-            libavcodec-dev libavformat-dev libswscale-dev libavutil-dev libpostproc-dev \
+            zlib1g-dev libbz2-dev liblzma-dev \
+            libopus-dev libmp3lame-dev libvorbis-dev libdav1d-dev \
             libvulkan-dev \
-            ffmpeg mkvtoolnix \
+            mkvtoolnix \
             file desktop-file-utils zsync \
             fuse libfuse2
 
@@ -125,6 +140,23 @@ jobs:
           sudo cmake --install /tmp/svt-av1-hdr/build
           sudo cp /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
 
+      - name: Build FFmpeg
+        # Ubuntu 24.04 ships 6.1, too old for Vship (AVCOL_SPC_YCGCO_RE), and the Docker
+        # image gets 8.1 from Alpine. Both artefacts run the same ffmpeg this way.
+        run: |
+          git clone --depth 1 --branch "$FFMPEG_VERSION" \
+            https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg
+          cd /tmp/ffmpeg
+          ./configure \
+            --prefix=/usr/local \
+            --enable-shared --disable-static \
+            --disable-doc --disable-ffplay \
+            --enable-gpl \
+            --enable-libopus --enable-libmp3lame --enable-libvorbis --enable-libdav1d
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+
       - name: Build FFMS2
         run: |
           git clone --depth 1 --branch "$FFMS2_VERSION" \
@@ -132,7 +164,8 @@ jobs:
           cd /tmp/ffms2
           mkdir -p src/config
           autoreconf -fiv
-          ./configure --prefix=/usr/local --enable-shared=yes --enable-static=no
+          PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+            ./configure --prefix=/usr/local --enable-shared=yes --enable-static=no
           make -j"$(nproc)"
           sudo make install
           sudo ldconfig
@@ -163,8 +196,8 @@ jobs:
           cp /usr/local/bin/SvtAv1EncApp      "$APPDIR/usr/bin/"
           cp /usr/local/bin/SvtAv1EncApp-hdr  "$APPDIR/usr/bin/"
           cp /usr/local/bin/ffmsindex         "$APPDIR/usr/bin/"
-          cp "$(command -v ffmpeg)"           "$APPDIR/usr/bin/"
-          cp "$(command -v ffprobe)"          "$APPDIR/usr/bin/"
+          cp /usr/local/bin/ffmpeg            "$APPDIR/usr/bin/"
+          cp /usr/local/bin/ffprobe           "$APPDIR/usr/bin/"
           cp "$(command -v mkvmerge)"         "$APPDIR/usr/bin/"
           cp /usr/local/bin/FFVship           "$APPDIR/usr/bin/"
 

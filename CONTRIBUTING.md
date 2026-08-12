@@ -166,7 +166,9 @@ toolchain - exist twice, as `ARG`s in the `Dockerfile` and as `env` in
 `.github/workflows/appimage.yml`. Renovate groups both into one PR as long as
 the two agree, so keep them in lockstep: let them drift and the image and the
 AppImage ship different encoders. SVT-AV1-HDR is a rolling repo and is pinned to
-a commit rather than a tag.
+a commit rather than a tag. FFmpeg is pinned in `appimage.yml` alone, since the
+image takes Alpine's package; keep the pin on the version Alpine ships, and note
+that Ubuntu's own is too old to build Vship against.
 
 Base images and GitHub Actions stay on version tags, never commit SHAs or
 digests. linuxdeploy is pinned to a release tag rather than its rolling
