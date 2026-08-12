@@ -13,7 +13,12 @@
 #   VERBOSE=1       Print Docker logs on failure
 
 AVXS_IMAGE="${AVXS_IMAGE:-avxs:test}"
-FIXTURES_DIR="${FIXTURES_DIR:-$(cd "$(dirname "$0")/../fixtures" 2>/dev/null && pwd)}"
+# run.sh generates the fixtures and exports this; a suite run on its own has no source
+# for them, and failing here beats a cascade of "cp: no such file".
+if [ -z "${FIXTURES_DIR:-}" ] || [ ! -d "${FIXTURES_DIR:-}" ]; then
+    printf "ERROR: FIXTURES_DIR is not set or does not exist - run the suite via ./test/run.sh\n" >&2
+    exit 2
+fi
 
 _FAIL=0
 _ERRORS=""
@@ -72,7 +77,8 @@ run_avxs() {
     AVXS_LOGS=$(docker logs "$cid" 2>&1) || true
     docker rm -f "$cid" >/dev/null 2>&1 || true
 
-    [ -e "$expected" ] && return 0 || return 1
+    # -s, not -e: every "expected 0 tracks" assertion reads a zero-byte file as a pass.
+    [ -s "$expected" ] && return 0 || return 1
 }
 
 # Run avxs for up to WAIT seconds, then stop. With an optional LOG_PATTERN it
@@ -131,9 +137,25 @@ assert_dir_not_exists() {
     [ ! -d "$1" ] || fail "expected directory NOT to exist: $1"
 }
 
+# An unreadable file counts 0 tracks just as convincingly as a correct one, so anything
+# asserting "no tracks of this kind" proves the file is readable first.
+assert_probeable() {
+    local file="$1"
+    if [ ! -s "$file" ]; then
+        fail "expected a non-empty file to probe: $file"
+        return 1
+    fi
+    if ! ffprobe -v error -i "$file" >/dev/null 2>&1; then
+        fail "ffprobe cannot read $file"
+        return 1
+    fi
+    return 0
+}
+
 assert_audio_track_count() {
     local file="$1" expected="$2"
     local actual
+    assert_probeable "$file" || return
     actual=$(ffprobe -v quiet -select_streams a \
         -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null | \
         grep "audio" | wc -l | tr -d ' ')
@@ -154,11 +176,30 @@ assert_audio_codec() {
 assert_subtitle_track_count() {
     local file="$1" expected="$2"
     local actual
+    assert_probeable "$file" || return
     actual=$(ffprobe -v quiet -select_streams s \
         -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null | \
         grep "subtitle" | wc -l | tr -d ' ')
     [ "$actual" = "$expected" ] || \
         fail "subtitle track count: expected $expected, got $actual ($file)"
+}
+
+assert_subtitle_language() {
+    local file="$1" idx="$2" expected="$3"
+    local actual
+    actual=$(ffprobe -v quiet -select_streams "s:${idx}" \
+        -show_entries stream_tags=language -of csv=p=0 "$file" 2>/dev/null | tr -d '\n')
+    [ "$actual" = "$expected" ] || \
+        fail "subtitle track $idx language: expected $expected, got '$actual' ($file)"
+}
+
+assert_audio_language() {
+    local file="$1" idx="$2" expected="$3"
+    local actual
+    actual=$(ffprobe -v quiet -select_streams "a:${idx}" \
+        -show_entries stream_tags=language -of csv=p=0 "$file" 2>/dev/null | tr -d '\n')
+    [ "$actual" = "$expected" ] || \
+        fail "audio track $idx language: expected $expected, got '$actual' ($file)"
 }
 
 assert_video_height() {
@@ -175,7 +216,11 @@ assert_video_height_le() {
     local actual
     actual=$(ffprobe -v quiet -select_streams v:0 \
         -show_entries stream=height -of csv=p=0 "$file" 2>/dev/null | tr -d '\n')
-    [ "${actual:-0}" -le "$max" ] || \
+    # Defaulting to 0 would turn "there is no output file" into a passing assertion.
+    case "$actual" in
+        ''|*[!0-9]*) fail "video height: could not read a height from $file"; return ;;
+    esac
+    [ "$actual" -le "$max" ] || \
         fail "video height: expected <= $max, got $actual ($file)"
 }
 
@@ -238,8 +283,55 @@ assert_video_height_lt() {
     local actual
     actual=$(ffprobe -v quiet -select_streams v:0 \
         -show_entries stream=height -of csv=p=0 "$file" 2>/dev/null | tr -d '\n')
-    [ "${actual:-0}" -lt "$max" ] || \
+    # Defaulting to 0 would turn "there is no output file" into a passing assertion.
+    case "$actual" in
+        ''|*[!0-9]*) fail "video height: could not read a height from $file"; return ;;
+    esac
+    [ "$actual" -lt "$max" ] || \
         fail "video height: expected < $max, got $actual ($file)"
+}
+
+# Starts at frame 0 and is gapless; a gap is source no chunk ever encodes. Not the tail -
+# job.rs clamps and extends that in memory. assert_video_frames covers a short encode.
+assert_scenes_cover() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        fail "scenes.json missing: $file"
+        return
+    fi
+
+    local problem
+    problem=$(tr -d ' \n' < "$file" \
+        | grep -o '"start_frame":[0-9]*,"end_frame":[0-9]*' \
+        | awk -F'[:,]' '
+            {
+                s = $2; e = $4
+                if (NR == 1 && s != 0) {
+                    print "first chunk starts at " s ", expected 0"; exit
+                }
+                if (NR > 1 && s != prev + 1) {
+                    print "chunk starts at " s " but the previous one ended at " prev; exit
+                }
+                if (e < s) { print "chunk " s ".." e " ends before it starts"; exit }
+                prev = e
+            }
+            END { if (NR == 0) print "no frame ranges found" }')
+
+    [ -z "$problem" ] || fail "scene list: $problem ($file)"
+}
+
+# The one assertion that catches a short encode: a truncated file still muxes and probes.
+assert_video_frames() {
+    local file="$1" expected="$2"
+    local actual
+    assert_probeable "$file" || return
+    actual=$(ffprobe -v quiet -select_streams v:0 -count_packets \
+        -show_entries stream=nb_read_packets -of csv=p=0 "$file" 2>/dev/null | tr -d '\n')
+    case "$actual" in
+        ''|*[!0-9]*) fail "frame count: could not read one from $file"; return ;;
+    esac
+    [ "$actual" = "$expected" ] || \
+        fail "frame count: expected $expected, got $actual ($file)"
 }
 
 assert_log_contains() {

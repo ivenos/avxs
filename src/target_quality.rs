@@ -11,29 +11,25 @@ use crate::resume::SceneEntry;
 // CRF granularity of the SVT-AV1 encoders (and the HDR fork): quarter steps.
 const CRF_STEP: f64 = 0.25;
 
-// Nominal JOD drop per CRF step, used only to seed the first interpolation from a
-// single probe. Calibrated on 4K HDR SVT-AV1 material (~0.02-0.03 JOD per CRF near
-// the target zone); the search refines it from the real probes.
+// Seeds the first interpolation only; measured on 4K HDR SVT-AV1 near the target zone.
 const NOMINAL_JOD_PER_CRF: f64 = 0.025;
 
-/// CVVDP display model for the output. HDR selects the PQ or HLG display by the
-/// encoded transfer; SDR picks the 4K or FHD display by output height.
-pub fn display_model_for(output_height: u32, hdr: bool, hlg: bool) -> &'static str {
-    if hdr && hlg {
-        "standard_hdr_hlg"
-    } else if hdr {
-        "standard_hdr_pq"
-    } else if output_height >= 1440 {
-        "standard_4k"
-    } else {
-        "standard_fhd"
+/// By the signalled transfer, not `avxs.hdr`: an SDR source under that flag measures
+/// ~2.5 JOD low against an HDR display.
+pub fn display_model_for(output_height: u32, hdr_args: &[String]) -> &'static str {
+    match signalled_transfer(hdr_args) {
+        Some("18") => "standard_hdr_hlg",
+        Some("16") => "standard_hdr_pq",
+        _ if output_height >= 1440 => "standard_4k",
+        _ => "standard_fhd",
     }
 }
 
-/// True when the auto-HDR args select the HLG transfer (arib-std-b67 = 18);
-/// otherwise HDR is treated as PQ (HDR10, plus the DV/HDR10+ HDR10 fallback).
-pub fn hdr_args_are_hlg(hdr_args: &[String]) -> bool {
-    hdr_args.windows(2).any(|w| w[0] == "--transfer-characteristics" && w[1] == "18")
+fn signalled_transfer(hdr_args: &[String]) -> Option<&str> {
+    hdr_args
+        .windows(2)
+        .find(|w| w[0] == "--transfer-characteristics")
+        .map(|w| w[1].as_str())
 }
 
 /// A Vulkan device reported by FFVship.
@@ -51,15 +47,13 @@ impl GpuSelection {
     }
 }
 
-/// Confirms FFVship runs and a hardware GPU is available. target_quality needs a GPU;
-/// a software-only Vulkan device (llvmpipe) or none is rejected with a clear error,
-/// because CVVDP on the CPU is far too slow to be practical.
+/// A software Vulkan device is rejected: CVVDP on the CPU is too slow to be practical.
 pub async fn ensure_available() -> Result<GpuSelection> {
-    let out = tokio::process::Command::new(external_bin("FFVship"))
-        .arg("--list-gpu")
-        .output()
+    let mut cmd = tokio::process::Command::new(external_bin("FFVship"));
+    cmd.arg("--list-gpu");
+    let out = crate::ext::output_with_timeout(&mut cmd, 120, "FFVship --list-gpu")
         .await
-        .context("run FFVship --list-gpu (is the FFVship tool bundled?)")?;
+        .context("is the FFVship tool bundled?")?;
     // With no usable Vulkan driver at all, FFVship aborts creating the instance.
     if !out.status.success() {
         bail!(
@@ -84,8 +78,7 @@ pub async fn ensure_available() -> Result<GpuSelection> {
     }
 }
 
-/// Parses `FFVship --list-gpu` ("GPU <id>: <name>") and returns the first hardware
-/// device, else the first software device (llvmpipe) so callers can tell them apart.
+/// First hardware device from `FFVship --list-gpu`, else the first software one.
 fn select_gpu(list: &str) -> Option<GpuSelection> {
     let mut devices: Vec<GpuSelection> = Vec::new();
     for line in list.lines() {
@@ -147,9 +140,8 @@ pub struct SolveResult {
     pub outcome: SolveOutcome,
 }
 
-/// Finds the highest CRF whose JOD holds the floor `tq.jod` and whose size stays
-/// under `tq.max_encoded_percent`. JOD falls monotonically as CRF rises, so this is
-/// a threshold search: interpolated binary search on a 0.25 grid.
+/// Highest CRF holding `tq.jod` under `tq.max_encoded_percent`. JOD falls monotonically
+/// with CRF, so this is an interpolated binary search on the 0.25 grid.
 pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveResult> {
     let lo = ctx.tq.min_crf as f64;
     let hi = ctx.tq.max_crf as f64;
@@ -181,6 +173,56 @@ pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveRe
         }
     }
 
+    // The search above follows the JOD floor only, so every probe can be over the cap.
+    while (pts.len() as u32) < ctx.tq.max_probes && !pts.iter().any(|p| p.size_pct <= cap) {
+        let highest = pts.iter().map(|p| p.crf).fold(f64::MIN, f64::max);
+        if highest >= hi - 1e-9 {
+            break;
+        }
+        let next = round_to_step((highest + hi) / 2.0, highest + CRF_STEP, hi);
+        if already(&pts, next) {
+            break;
+        }
+        let (jod, size_pct) = probe_once(ctx, scene, next)?;
+        tracing::info!(
+            "[{}] chunk {key} probe {}/{} crf {next} gives JOD {jod:.3}, {size_pct:.0}% size (chasing the size cap)",
+            ctx.stem, pts.len() + 1, ctx.tq.max_probes
+        );
+        pts.push(Probe { crf: next, jod, size_pct });
+    }
+
+    // That bisection can overshoot, and a lower CRF under the cap is free quality.
+    while (pts.len() as u32) < ctx.tq.max_probes
+        && !pts.iter().any(|p| p.jod >= target && p.size_pct <= cap)
+    {
+        let Some(fit) = pts.iter().filter(|p| p.size_pct <= cap).map(|p| p.crf).reduce(f64::min)
+        else {
+            break;
+        };
+        let Some(over) = pts
+            .iter()
+            .filter(|p| p.size_pct > cap && p.crf < fit)
+            .map(|p| p.crf)
+            .reduce(f64::max)
+        else {
+            break;
+        };
+        // Grid-aligned, so anything above one step is at least two.
+        if fit - over <= CRF_STEP + 1e-9 {
+            break;
+        }
+        let next = round_to_step((over + fit) / 2.0, over + CRF_STEP, fit - CRF_STEP);
+        if already(&pts, next) {
+            break;
+        }
+        let (jod, size_pct) = probe_once(ctx, scene, next)?;
+        tracing::info!(
+            "[{}] chunk {key} probe {}/{} crf {next} gives JOD {jod:.3}, {size_pct:.0}% size (narrowing the size cap)",
+            ctx.stem, pts.len() + 1, ctx.tq.max_probes
+        );
+        pts.push(Probe { crf: next, jod, size_pct });
+    }
+
     Ok(decide(&pts, target, cap, lo))
 }
 
@@ -198,8 +240,8 @@ fn seed_crf(config: &Config, lo: f64, hi: f64) -> f64 {
         .clamp(lo, hi)
 }
 
-/// Encodes the chunk at `crf` (probe preset), measures CVVDP JOD, and reports the
-/// encoded size relative to the source over the chunk's duration.
+/// Both readings carry the probe preset's bias, and both err on the safe side: the
+/// final encode lands above the probed JOD and below the probed size.
 fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<(f64, f64)> {
     let tag = format!("{}_{crf}", scene.padded_index());
     let probe = ctx.temp_dir.join(format!("probe_{tag}.ivf"));
@@ -212,6 +254,8 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<(f64, 
         ctx.opts,
         encode::EncodeOverrides { crf: Some(crf), preset: Some(ctx.tq.probe_preset) },
     )
+    // Nothing else in the temp dir's housekeeping knows about probe files.
+    .inspect_err(|_| { let _ = std::fs::remove_file(&probe); })
     .with_context(|| format!("probe encode crf {crf}"))?;
 
     let result = measure(&MeasureOpts {
@@ -234,8 +278,7 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<(f64, 
     Ok((jod, size_pct))
 }
 
-/// Encoded size as a percent of the source's actual bytes for this chunk's frames.
-/// Returns 0 when the source index is unavailable, so the cap simply never binds.
+/// Percent of the source's own bytes for these frames; 0 when the index is missing.
 fn chunk_size_pct(encoded: u64, cum: &[u64], start: u64, end: u64) -> f64 {
     match (cum.get(start as usize), cum.get(end as usize + 1)) {
         (Some(lo), Some(hi)) if hi > lo => encoded as f64 / (hi - lo) as f64 * 100.0,
@@ -243,8 +286,7 @@ fn chunk_size_pct(encoded: u64, cum: &[u64], start: u64, end: u64) -> f64 {
     }
 }
 
-/// Picks the next CRF to probe, or None when the crossing is bracketed to one
-/// 0.25 step, a bound is reached, or no new grid point remains.
+/// None once the crossing is bracketed to one step, a bound is hit, or the grid is used.
 fn next_crf(pts: &[Probe], target: f64, lo: f64, hi: f64) -> Option<f64> {
     let pass: Vec<f64> = pts.iter().filter(|p| p.jod >= target).map(|p| p.crf).collect();
     let fail: Vec<f64> = pts.iter().filter(|p| p.jod <  target).map(|p| p.crf).collect();
@@ -295,8 +337,7 @@ fn interpolate_crf(pts: &[Probe], target: f64) -> f64 {
     a.0 + slope * (target - a.1)
 }
 
-/// Two (crf, jod) points to interpolate between: one at/above and one below the
-/// target if possible, otherwise the two closest in JOD.
+/// One point at/above and one below the target, else the two closest in JOD.
 fn bracket_pts(pts: &[Probe], target: f64) -> ((f64, f64), (f64, f64)) {
     let above = pts.iter().filter(|p| p.jod >= target).min_by(|x, y| x.jod.total_cmp(&y.jod));
     let below = pts.iter().filter(|p| p.jod <  target).max_by(|x, y| x.jod.total_cmp(&y.jod));
@@ -316,26 +357,34 @@ fn already(pts: &[Probe], crf: f64) -> bool {
     pts.iter().any(|p| (p.crf - crf).abs() < 1e-9)
 }
 
-/// Final CRF over the gathered probes. Quality floor sets an upper CRF bound, the
-/// size cap a lower one; we take the highest CRF in the overlap. If the cap forces
-/// a higher CRF than the floor allows, the cap wins. If nothing holds the floor,
-/// the best-quality probe is used.
+/// Highest CRF holding both, else the floor gives way to the cap, else the smallest chunk.
 fn decide(pts: &[Probe], target: f64, cap: f64, lo: f64) -> SolveResult {
-    let floor = pts.iter().filter(|p| p.jod >= target)
-        .max_by(|a, b| a.crf.total_cmp(&b.crf)).copied();
-    let under_cap = pts.iter().filter(|p| p.size_pct <= cap)
-        .min_by(|a, b| a.crf.total_cmp(&b.crf)).copied();
-
     let res = |p: Probe, outcome| SolveResult { crf: p.crf, jod: p.jod, size_pct: p.size_pct, outcome };
+    let floor_reachable = pts.iter().any(|p| p.jod >= target);
 
-    match (floor, under_cap) {
-        (Some(fl), Some(sz)) if sz.crf > fl.crf + 1e-9 => res(sz, SolveOutcome::CapBinding),
-        (Some(fl), _) => res(fl, SolveOutcome::Met),
-        (None, _) => pts.iter()
-            .max_by(|a, b| a.jod.total_cmp(&b.jod))
-            .map(|&p| res(p, SolveOutcome::FloorUnreachable))
-            .unwrap_or(SolveResult { crf: lo, jod: f64::NAN, size_pct: f64::NAN, outcome: SolveOutcome::FloorUnreachable }),
+    if let Some(p) = pts.iter()
+        .filter(|p| p.jod >= target && p.size_pct <= cap)
+        .max_by(|a, b| a.crf.total_cmp(&b.crf))
+        .copied()
+    {
+        return res(p, SolveOutcome::Met);
     }
+
+    // Nothing holds both, so the cap wins: lowest CRF that fits is the best quality left.
+    if let Some(p) = pts.iter()
+        .filter(|p| p.size_pct <= cap)
+        .min_by(|a, b| a.crf.total_cmp(&b.crf))
+        .copied()
+    {
+        let outcome = if floor_reachable { SolveOutcome::CapBinding } else { SolveOutcome::FloorUnreachable };
+        return res(p, outcome);
+    }
+
+    // Every probe over the cap: the smallest chunk is the closest thing to honouring it.
+    pts.iter()
+        .min_by(|a, b| a.size_pct.total_cmp(&b.size_pct))
+        .map(|&p| res(p, SolveOutcome::CapBinding))
+        .unwrap_or(SolveResult { crf: lo, jod: f64::NAN, size_pct: f64::NAN, outcome: SolveOutcome::FloorUnreachable })
 }
 
 struct MeasureOpts<'a> {
@@ -366,10 +415,8 @@ impl Drop for Cleanup {
     }
 }
 
-/// Whole-chunk CVVDP JOD of `distorted` (the probe, frames from 0) against the
-/// source starting at `start`. FFVship decodes both via ffms2, crops the source to
-/// match the encode, resizes the encode on any size mismatch, and writes per-frame
-/// cumulative JOD; the last value is the chunk score.
+/// FFVship crops the source to match and resizes on a mismatch; its last cumulative
+/// JOD is the chunk score.
 fn measure(m: &MeasureOpts) -> Result<f64> {
     let json = m.work_dir.join(format!("cvvdp_{}.json", m.tag));
     let _cleanup = Cleanup(vec![json.clone()]);
@@ -397,14 +444,19 @@ fn measure(m: &MeasureOpts) -> Result<f64> {
             .args(["--cropBottomSource", &bottom.to_string()]);
     }
 
-    let out = cmd
+    // A wedged GPU takes the worker with it, and nothing above would notice.
+    const TIMEOUT_SECS: u64 = 1800;
+
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .output()
-        .context("run FFVship")?;
-    if !out.status.success() {
-        bail!("FFVship failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        .spawn()
+        .context("start FFVship")?;
+    let (status, stderr) =
+        crate::ext::blocking_output_with_timeout(&mut child, TIMEOUT_SECS, "FFVship")?;
+    if !status.success() {
+        bail!("FFVship failed:\n{stderr}");
     }
 
     let raw = std::fs::read_to_string(&json)
@@ -412,8 +464,7 @@ fn measure(m: &MeasureOpts) -> Result<f64> {
     parse_cvvdp(&raw)
 }
 
-/// CVVDP JSON is `[[cum_0_0], [cum_0_1], ...]`; the last row's value is the score
-/// of the whole clip (frame 0 to last).
+/// CVVDP JSON is `[[cum], [cum], ...]`; the last row is the whole clip's score.
 fn parse_cvvdp(raw: &str) -> Result<f64> {
     let rows: Vec<Vec<f64>> = serde_json::from_str(raw).context("parse FFVship CVVDP json")?;
     rows.last()
@@ -431,24 +482,19 @@ mod tests {
     }
 
     #[test]
-    fn display_model_picked_by_height_and_hdr() {
-        assert_eq!(display_model_for(720, false, false), "standard_fhd");
-        assert_eq!(display_model_for(1080, false, false), "standard_fhd");
-        assert_eq!(display_model_for(1439, false, false), "standard_fhd");
-        assert_eq!(display_model_for(1440, false, false), "standard_4k");
-        assert_eq!(display_model_for(2160, false, false), "standard_4k");
-        assert_eq!(display_model_for(2160, true, false), "standard_hdr_pq");
-        // HLG picks the HLG display even at 4K
-        assert_eq!(display_model_for(2160, true, true), "standard_hdr_hlg");
-    }
+    fn display_model_follows_the_signalled_transfer() {
+        let args = |t: &str| vec!["--transfer-characteristics".to_string(), t.to_string()];
 
-    #[test]
-    fn hlg_detected_from_transfer_arg() {
-        let pq = vec!["--transfer-characteristics".to_string(), "16".to_string()];
-        let hlg = vec!["--transfer-characteristics".to_string(), "18".to_string()];
-        assert!(!hdr_args_are_hlg(&pq));
-        assert!(hdr_args_are_hlg(&hlg));
-        assert!(!hdr_args_are_hlg(&[]));
+        assert_eq!(display_model_for(2160, &args("16")), "standard_hdr_pq");
+        assert_eq!(display_model_for(2160, &args("18")), "standard_hdr_hlg");
+        assert_eq!(display_model_for(720, &args("18")), "standard_hdr_hlg");
+
+        // `avxs.hdr` on an SDR source signals bt709; an HDR display costs it ~2.5 JOD.
+        assert_eq!(display_model_for(1080, &args("1")), "standard_fhd");
+        assert_eq!(display_model_for(2160, &args("1")), "standard_4k");
+
+        assert_eq!(display_model_for(1439, &[]), "standard_fhd");
+        assert_eq!(display_model_for(1440, &[]), "standard_4k");
     }
 
     #[test]
@@ -545,5 +591,32 @@ mod tests {
         assert_eq!(seed_crf(&config, 14.0, 45.0), 45.0);
         config.encoder_params.clear();
         assert_eq!(seed_crf(&config, 18.0, 44.0), 31.0);
+    }
+
+    #[test]
+    fn decide_floor_unreachable_still_respects_the_cap() {
+        // The best-quality probe is four times the size of the source.
+        let pts = vec![p(1.0, 9.0, 398.0), p(20.0, 8.8, 120.0), p(35.0, 8.5, 60.0)];
+        let r = decide(&pts, 9.5, 90.0, 14.0);
+        assert_eq!(r.crf, 35.0);
+        assert!(matches!(r.outcome, SolveOutcome::FloorUnreachable));
+    }
+
+    #[test]
+    fn decide_reports_cap_binding_when_no_probe_fits() {
+        // Pre-compressed source: every probe over the cap, and none of it was "Met".
+        let pts = vec![p(35.0, 9.6, 300.0), p(41.0, 9.5, 259.0)];
+        let r = decide(&pts, 9.5, 90.0, 14.0);
+        assert_eq!(r.crf, 41.0);
+        assert_eq!(r.size_pct, 259.0);
+        assert!(matches!(r.outcome, SolveOutcome::CapBinding));
+    }
+
+    #[test]
+    fn decide_prefers_the_highest_crf_holding_both_constraints() {
+        let pts = vec![p(20.0, 9.9, 95.0), p(30.0, 9.7, 80.0), p(36.0, 9.5, 70.0), p(44.0, 9.1, 50.0)];
+        let r = decide(&pts, 9.5, 90.0, 14.0);
+        assert_eq!(r.crf, 36.0);
+        assert!(matches!(r.outcome, SolveOutcome::Met));
     }
 }

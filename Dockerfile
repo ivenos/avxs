@@ -16,8 +16,7 @@ ARG VSHIP_VERSION
 ARG RUST_VERSION
 ARG TARGETARCH
 
-# clang + vulkan-headers/loader build Vship's FFVship (Vulkan backend, no CUDA/HIP).
-# nasm/yasm are x86-only assemblers; SVT-AV1 uses NEON on arm64 instead.
+# clang + vulkan build FFVship; nasm/yasm are x86-only, arm64 uses NEON.
 RUN apk add --no-cache \
         build-base \
         clang \
@@ -64,8 +63,7 @@ RUN git clone --filter=blob:none --no-checkout \
     cmake --install /svt-av1-hdr/build && \
     rm -rf /svt-av1-hdr
 
-# Build FFMS2 as a shared library to avoid C++ static-init crashes when
-# embedded in a Rust binary
+# Shared, not static: C++ static-init crashes when embedded in a Rust binary.
 RUN git clone --depth 1 --branch ${FFMS2_VERSION} \
         https://github.com/FFMS/ffms2.git /ffms2 && \
     cd /ffms2 && \
@@ -91,10 +89,13 @@ COPY src ./src
 
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 ENV RUSTFLAGS="-C target-feature=-crt-static"
+# The touch is load-bearing: COPY carries host mtimes in, /src/target is a cache mount,
+# and cargo would call the crate fresh and ship a stale binary.
 RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
     --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
     --mount=type=cache,target=/src/target,id=cargo-target-${TARGETARCH} \
-    cargo build --release && \
+    find src build.rs -type f -exec touch {} + && \
+    cargo build --release --locked && \
     cp /src/target/release/avxs /avxs
 
 FROM alpine:3.24 AS runtime
@@ -114,15 +115,12 @@ COPY --from=builder /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1EncApp
 COPY --from=builder /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
 COPY --from=builder /usr/local/bin/ffmsindex         /usr/local/bin/ffmsindex
 COPY --from=builder /avxs                             /usr/local/bin/avxs
-# libffms2.so is not in Alpine's package manager - copy from builder
+# Not in Alpine's package manager.
 COPY --from=builder /usr/local/lib/libffms2.so*      /usr/local/lib/
-# FFVship (GPU metric tool, Vulkan) + libvship for target_quality
+# FFVship + libvship, for target_quality.
 COPY --from=builder /usr/local/bin/FFVship           /usr/local/bin/FFVship
 COPY --from=builder /usr/local/lib/libvship.so       /usr/local/lib/
-# Add /usr/local/lib to musl dynamic linker search path (filename is arch-specific)
-RUN printf '/lib\n/usr/lib\n/usr/local/lib\n' > /etc/ld-musl-$(uname -m).path
-
-VOLUME ["/input", "/output"]
+# musl searches /usr/local/lib itself, so no /etc/ld-musl-<arch>.path is needed.
 
 ENV AVXS_INPUT_DIR=/input
 ENV AVXS_OUTPUT_DIR=/output

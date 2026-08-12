@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
 use crate::audio;
@@ -19,8 +19,31 @@ pub struct JobContext {
     pub output_dir: PathBuf,
 }
 
-/// Per-job context shared by every chunk worker, cloned as one Arc per task
-/// instead of threading a dozen values through each spawn.
+/// Clears on its own or on the user's next edit: retried, never marked `.failed`.
+#[derive(Debug)]
+pub struct Transient;
+
+impl std::fmt::Display for Transient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "retrying on the next scan")
+    }
+}
+
+impl std::error::Error for Transient {}
+
+/// `downcast_ref`, not `chain()`: a `.context()` value is not a link there. ENOSPC too.
+fn is_transient(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<Transient>().is_some() {
+        return true;
+    }
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+    })
+}
+
+/// Per-job context, cloned as one Arc per chunk task.
 struct WorkerCtx {
     source: PathBuf,
     index: PathBuf,
@@ -39,17 +62,20 @@ struct WorkerCtx {
     total_frames: u64,
     /// Cumulative source byte sizes by frame for the size cap; empty when unused.
     source_byte_index: Arc<Vec<u64>>,
+    /// Set when a chunk fails, so queued workers return instead of starting.
+    cancel: AtomicBool,
 }
 
 pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
-    let config = Arc::new(Config::from_file(&job.encode_toml)?);
+    // Marking every video in the folder would keep them all skipped after the fix.
+    let config = Arc::new(Config::from_file(&job.encode_toml).context(Transient)?);
 
     let stem = job.stem();
 
     wait_for_stable(&job.source_file, stem).await?;
 
     let temp = TempDir::for_video(&ctx.output_dir, stem);
-    temp.create_dirs()?;
+    temp.claim_source(&job.source_file, stem)?;
 
     if config.avxs.video == VideoMode::Copy {
         return run_copy(job, ctx, &config, stem, &temp).await;
@@ -89,13 +115,25 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let hdr_args: Vec<String> = if config.avxs.hdr {
         let hdr = crate::hdr::detect(&job.source_file).await?;
-        if hdr.hdr_type == "Dolby Vision" || hdr.hdr_type == "HDR10+" {
-            tracing::info!(
-                "[{stem}] HDR: {} (not supported, passing HDR10 fallback metadata)",
-                hdr.hdr_type
+        // Profile 5's base layer is IPT-PQ-C2, an image only once the RPU is applied.
+        if hdr.dv_profile == Some(5) {
+            bail!(
+                "Dolby Vision profile 5 has no HDR10 base layer, so avxs cannot encode it \
+                 correctly. Convert the source to profile 8 or to plain HDR10 first."
             );
-        } else {
-            tracing::info!("[{stem}] HDR: {}", hdr.hdr_type);
+        }
+        match (hdr.dv_profile, hdr.hdr_type.as_str()) {
+            (Some(p), _) => tracing::info!(
+                "[{stem}] HDR: Dolby Vision profile {p} (RPU dropped, HDR10 base layer kept)"
+            ),
+            (None, "Dolby Vision") => tracing::warn!(
+                "[{stem}] HDR: Dolby Vision of unknown profile (RPU dropped; the base layer \
+                 is only a valid HDR10 picture on profiles 7 and 8)"
+            ),
+            (None, "HDR10+") => tracing::info!(
+                "[{stem}] HDR: HDR10+ (dynamic metadata dropped, static HDR10 kept)"
+            ),
+            (None, t) => tracing::info!("[{stem}] HDR: {t}"),
         }
         hdr.encoder_args()
     } else {
@@ -135,15 +173,18 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         target_bit_depth: config.avxs.bit_depth,
     });
 
-    // Effective encoder args, shared by the summary log and the cache fingerprint.
     let merged_args = encode::merged_encoder_args(&config, &encode_opts);
 
-    // Discard cached scenes/chunks if the encode profile changed since the last run,
-    // so a resumed encode never mixes chunks from different settings.
-    let fingerprint = profile_fingerprint(&merged_args, &encode_opts, &config.scene_detection, config.target_quality.as_ref());
+    // So a resumed encode never mixes chunks from different settings.
+    let fingerprint = profile_fingerprint(
+        config.encoder, &merged_args, &encode_opts, &config.scene_detection,
+        config.target_quality.as_ref(),
+    );
     invalidate_stale_cache(&temp, &fingerprint, stem)?;
 
-    let scenes: Vec<SceneEntry> = if temp.scenes_path.exists() {
+    // Non-empty, not just present: the fingerprint keeps a crash leftover alive forever.
+    let have_scenes = std::fs::metadata(&temp.scenes_path).is_ok_and(|m| m.len() > 0);
+    let scenes: Vec<SceneEntry> = if have_scenes {
         tracing::info!("[{stem}] reusing scenes.json");
         crate::resume::read_scenes(&temp.scenes_path)?
     } else {
@@ -162,7 +203,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     // clamp to FFMS2 frame count - scene detector may overcount on broken remuxes
     let ffms2_frames = video_info.num_frames as u64;
-    let scenes: Vec<SceneEntry> = scenes
+    let mut scenes: Vec<SceneEntry> = scenes
         .into_iter()
         .filter_map(|mut s| {
             if s.start_frame >= ffms2_frames {
@@ -183,6 +224,19 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         })
         .collect();
 
+    // The detector counts decoded frames, FFMS2 counts them in the container.
+    match scenes.last_mut() {
+        None => bail!("scene detection produced no chunks within the source frame count"),
+        Some(last) if last.end_frame + 1 < ffms2_frames => {
+            tracing::warn!(
+                "[{stem}] scenes cover {} of {ffms2_frames} frames - extending the last chunk to the end",
+                last.end_frame + 1
+            );
+            last.end_frame = ffms2_frames - 1;
+        }
+        Some(_) => {}
+    }
+
     let total_chunks = scenes.len();
     let total_frames: u64 = scenes.iter().map(|s| s.frame_count()).sum();
 
@@ -200,15 +254,14 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         tracing::info!("[{stem}] audio {line}");
     }
 
-    // Target quality: probe the metric tool once and pick the CVVDP display model.
-    // FFVship compares at the source resolution (a scaled-down encode is resized up to
-    // it), so the display model is keyed off the source/crop height, not the scaled output.
+    // FFVship compares at source resolution, so the model follows the crop, not the scale.
     let reference_height = encode_opts.crop.map(|c| c.h).unwrap_or(video_info.height);
     let (tq_display_model, tq_gpu_id, crf_cache): (Option<String>, Option<u32>, Option<Arc<CrfCache>>) =
         if let Some(tq) = &config.target_quality {
-            let gpu = target_quality::ensure_available().await?;
-            let hlg = target_quality::hdr_args_are_hlg(&encode_opts.hdr_args);
-            let display_model = target_quality::display_model_for(reference_height, config.avxs.hdr, hlg);
+            // A driver upgrade or a GPU in reset clears on its own.
+            let gpu = target_quality::ensure_available().await.context(Transient)?;
+            let display_model =
+                target_quality::display_model_for(reference_height, &encode_opts.hdr_args);
             tracing::info!(
                 "[{stem}] target quality: JOD {} floor (display {display_model}, {}, crf {}-{}, {}-{} probes, probe preset {}, max {}% size)",
                 tq.jod, gpu.describe(), tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset, tq.max_encoded_percent
@@ -229,9 +282,8 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let completed_frames   = Arc::new(AtomicU64::new(0));
     let mut set = tokio::task::JoinSet::new();
 
-    // Actual source bytes per frame for the size cap (target quality only).
     let source_byte_index = if config.target_quality.is_some() {
-        Arc::new(probe_source_byte_index(&job.source_file).await)
+        Arc::new(probe_source_byte_index(&job.source_file, stem).await)
     } else {
         Arc::new(Vec::new())
     };
@@ -253,6 +305,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         total_chunks,
         total_frames,
         source_byte_index,
+        cancel: AtomicBool::new(false),
     });
 
     for scene in &scenes {
@@ -275,6 +328,10 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
         set.spawn(async move {
             let _permit = sem.acquire().await.context("acquire semaphore")?;
+
+            if w.cancel.load(Ordering::Relaxed) {
+                return anyhow::Ok(());
+            }
 
             let scene_frames = scene.frame_count();
             let crf_override = resolve_crf(&w, &chunk_key, &scene).await?;
@@ -306,64 +363,124 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         });
     }
 
+    // Drain, never drop: aborting a JoinSet cannot stop a spawn_blocking closure.
+    let mut first_err: Option<anyhow::Error> = None;
     while let Some(res) = set.join_next().await {
-        res.context("chunk task join")??;
+        let outcome = res
+            .context("chunk task join")
+            .and_then(|inner| inner);
+        if let Err(e) = outcome {
+            wctx.cancel.store(true, Ordering::Relaxed);
+            first_err.get_or_insert(e);
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
 
     tracing::info!("[{stem}] merging chunks");
-    let video_only  = ctx.output_dir.join(format!(".avxs_{stem}_video.mkv"));
+    // Inside the temp dir, so a failure here leaves nothing stranded next to the output.
+    let video_only  = temp.video_path.clone();
     let chunk_paths: Vec<PathBuf> =
         scenes.iter().map(|s| temp.chunk_path(&s.padded_index())).collect();
     encode::concat_chunks(&chunk_paths, &video_only, &temp.path).await?;
 
     tracing::info!("[{stem}] processing audio");
-    finalize(job, ctx, &config, &temp, &audio_plan, &video_only, true).await
+    let video = MuxVideo { path: &video_only, remove: true, expected_frames: Some(total_frames) };
+    finalize(job, ctx, &config, &temp, &audio_plan, video).await
+}
+
+struct MuxVideo<'a> {
+    /// The merged encode (run) or the untouched source (run_copy).
+    path: &'a Path,
+    /// Delete `path` after muxing; true only when it is avxs's own temp file.
+    remove: bool,
+    /// Frames the finished file has to hold; None for `video = copy`.
+    expected_frames: Option<u64>,
 }
 
 /// Shared tail of run/run_copy: process audio, mux, validate, archive source, clean up.
-/// `mux_video` is the encoded video (run) or the untouched source (run_copy);
-/// `remove_mux_video` deletes it afterwards when it is a temp file.
 async fn finalize(
     job: &Job,
     ctx: &JobContext,
     config: &Config,
     temp: &TempDir,
     audio_plan: &audio::AudioPlan,
-    mux_video: &Path,
-    remove_mux_video: bool,
+    video: MuxVideo<'_>,
 ) -> Result<()> {
     let stem = job.stem();
-    let audio_path = audio::process_plan(&job.source_file, &temp.path, audio_plan).await?;
+    audio::process_plan(&job.source_file, &temp.audio_path, audio_plan).await?;
+    let audio_path = &temp.audio_path;
 
     let subtitle_sel = crate::subtitle::select_tracks(&job.source_file, &config.subtitles).await?;
 
     let final_output = ctx.output_dir.join(format!("{stem}.mkv"));
-    tracing::info!("[{stem}] muxing to {}", final_output.display());
-    audio::mux_final(mux_video, &audio_path, &job.source_file, &final_output, &subtitle_sel).await?;
+    // An empty file is a leftover, not a result; the scanner ignores it for the same reason.
+    match std::fs::metadata(&final_output) {
+        Ok(m) if m.len() > 0 => bail!("output already exists: {}", final_output.display()),
+        Ok(_) => tracing::warn!("[{stem}] replacing empty {}", final_output.display()),
+        Err(_) => {}
+    }
 
-    if remove_mux_video {
-        let _ = std::fs::remove_file(mux_video);
+    // Into the temp dir first: the next scan reads a half-written output as "already done".
+    tracing::info!("[{stem}] muxing to {}", final_output.display());
+    audio::mux_final(video.path, audio_path, &job.source_file, &temp.mux_path, &subtitle_sel).await?;
+
+    if video.remove {
+        let _ = std::fs::remove_file(video.path);
     }
 
     tracing::info!("[{stem}] validating output");
-    encode::validate_output(&final_output).await?;
+    encode::validate_output(&temp.mux_path, video.expected_frames).await?;
 
-    let processed_dir = crate::scanner::ensure_processed_dir(&ctx.input_dir)?;
-    let dest = processed_dir.join(job.source_file.file_name().unwrap());
-    std::fs::rename(&job.source_file, &dest)
-        .with_context(|| format!("move source: {} to {}", job.source_file.display(), dest.display()))?;
+    std::fs::rename(&temp.mux_path, &final_output).with_context(|| {
+        format!("move {} to {}", temp.mux_path.display(), final_output.display())
+    })?;
 
-    if !config.avxs.keep_temp {
-        std::fs::remove_dir_all(&temp.path)
-            .with_context(|| format!("remove temp dir: {}", temp.path.display()))?;
+    // Delivered: the scanner short-circuits on "output exists", so nothing below retries.
+    if let Err(e) = archive_source(job, ctx) {
+        tracing::error!("[{stem}] output is in place, but archiving the source failed: {e:#}");
+    }
+
+    if !config.avxs.keep_temp
+        && let Err(e) = std::fs::remove_dir_all(&temp.path)
+    {
+        tracing::error!("[{stem}] could not remove temp dir {}: {e:#}", temp.path.display());
     }
 
     tracing::info!("[{stem}] done");
     Ok(())
 }
 
-/// Target-quality CRF for a chunk: cached value, else probe-and-solve (then cache it).
-/// Returns None when target quality is not active.
+/// Never over an existing file: two seasons can each have an `Episode 01.mkv`.
+fn archive_source(job: &Job, ctx: &JobContext) -> Result<()> {
+    let processed_dir = crate::scanner::ensure_processed_dir(&ctx.input_dir)?;
+    let name = job.source_file.file_name().context("source has no file name")?;
+    let dest = free_path(&processed_dir.join(name))?;
+
+    std::fs::rename(&job.source_file, &dest)
+        .with_context(|| format!("move source: {} to {}", job.source_file.display(), dest.display()))
+}
+
+/// `path` if free, else the same name with a `.2`, `.3`, ... before the extension.
+fn free_path(path: &Path) -> Result<PathBuf> {
+    if !path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+
+    for n in 2..1000u32 {
+        let candidate = dir.join(format!("{stem}.{n}{ext}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("no free name for {} after 1000 tries", path.display())
+}
+
+/// Cached CRF, else probe-and-solve; None when target quality is off.
 async fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Option<f64>> {
     let (Some(tq), Some(display_model), Some(gpu_id), Some(cache)) =
         (&w.tq, &w.tq_display_model, &w.tq_gpu_id, &w.crf_cache) else {
@@ -418,12 +535,22 @@ async fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Resu
     Ok(Some(res.crf))
 }
 
-pub fn handle_failure(_job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Error) {
+pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Error) {
+    // Still loud - a typo in encode.toml has to be seen - but not a verdict on the file.
+    if is_transient(err) {
+        tracing::error!("[{stem}] job failed - retrying on the next scan\n{err:#}");
+        return;
+    }
+
     tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
 
     let temp = TempDir::for_video(&ctx.output_dir, stem);
     if let Err(e) = temp.create_dirs() {
         tracing::warn!("[{stem}] could not create temp dir for failure marker: {e:#}");
+    }
+    // So the marker locks out this file, not the next one with the same name.
+    if let Err(e) = std::fs::write(&temp.source_id_path, job.source_file.display().to_string()) {
+        tracing::warn!("[{stem}] could not record source path: {e:#}");
     }
     if let Err(e) = std::fs::write(&temp.failed_path, format!("{err:#}")) {
         tracing::warn!("[{stem}] could not write failure marker: {e:#}");
@@ -442,7 +569,8 @@ async fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp
     }
 
     tracing::info!("[{stem}] copy video, processing audio");
-    finalize(job, ctx, config, temp, &audio_plan, &job.source_file, false).await
+    let video = MuxVideo { path: &job.source_file, remove: false, expected_frames: None };
+    finalize(job, ctx, config, temp, &audio_plan, video).await
 }
 
 fn ignored_video_opts(a: &crate::config::AvxsConfig) -> Vec<&'static str> {
@@ -455,9 +583,7 @@ fn ignored_video_opts(a: &crate::config::AvxsConfig) -> Vec<&'static str> {
     v
 }
 
-/// Returns `(scale_target, crop, scene_vf_filter)`.
-/// Crop is in source space and applied before scaling; `scale_target` is the ffmpeg
-/// scale size for the cropped content. `scene_vf` mirrors crop+scale for detection.
+/// `(scale_target, crop, scene_vf)`. Crop is in source space and runs before the scale.
 fn compute_output_params(
     src_w: u32,
     src_h: u32,
@@ -465,7 +591,17 @@ fn compute_output_params(
     target_height: Option<u32>,
     stem: &str,
 ) -> (Option<(u32, u32)>, Option<Crop>, Option<String>) {
-    let src_crop = crop_str.and_then(Crop::from_str);
+    // Once, here: Y4M writer, detection filter and FFVship all read this rectangle.
+    let src_crop = crop_str.and_then(Crop::from_str).and_then(|c| {
+        let n = c.normalized(src_w, src_h);
+        if n.is_none() {
+            tracing::warn!(
+                "[{stem}] ignoring crop {}:{}:{}:{} - does not fit {src_w}x{src_h}",
+                c.w, c.h, c.x, c.y
+            );
+        }
+        n
+    });
 
     let (eff_w, eff_h) = match src_crop {
         Some(c) => (c.w, c.h),
@@ -484,16 +620,17 @@ fn compute_output_params(
         (tw, th)
     });
 
-    let scene_vf = build_scene_vf(crop_str, scale_target);
+    let scene_vf = build_scene_vf(src_crop, scale_target);
 
     (scale_target, src_crop, scene_vf)
 }
 
 /// ffmpeg -vf filter for scene detection (source-space crop + optional scale).
-fn build_scene_vf(crop_str: Option<&str>, scale_target: Option<(u32, u32)>) -> Option<String> {
-    match (crop_str, scale_target) {
+fn build_scene_vf(crop: Option<Crop>, scale_target: Option<(u32, u32)>) -> Option<String> {
+    let crop = crop.map(|c| c.to_filter());
+    match (crop, scale_target) {
         (None,    None)         => None,
-        (Some(c), None)         => Some(c.to_owned()),
+        (Some(c), None)         => Some(c),
         (None,    Some((w, h))) => Some(format!("scale={w}:{h}")),
         (Some(c), Some((w, h))) => Some(format!("{c},scale={w}:{h}")),
     }
@@ -504,8 +641,8 @@ fn round_down_even(v: u32) -> u32 {
 }
 
 /// Stable hash of everything that affects chunk output and scene boundaries.
-/// Used to spot a changed encode profile between resumes.
 fn profile_fingerprint(
+    encoder: Option<crate::config::Encoder>,
     merged_args: &[String],
     opts: &EncodeOptions,
     scene_cfg: &crate::config::SceneDetectionConfig,
@@ -513,6 +650,7 @@ fn profile_fingerprint(
 ) -> String {
     use std::hash::{Hash, Hasher};
     let parts = [
+        format!("{encoder:?}"),
         merged_args.join(" "),
         format!("{:?}", opts.scale),
         format!("{:?}", opts.crop),
@@ -525,8 +663,7 @@ fn profile_fingerprint(
     format!("{:016x}", h.finish())
 }
 
-/// Wipes cached scenes/chunks when the profile fingerprint changed, then records the
-/// new one. The frame index and crop cache survive (they depend only on the source).
+/// Index and crop cache survive a profile change; they depend only on the source.
 fn invalidate_stale_cache(temp: &TempDir, fingerprint: &str, stem: &str) -> Result<()> {
     let prev = std::fs::read_to_string(&temp.fingerprint_path).ok();
     if prev.as_deref() == Some(fingerprint) {
@@ -544,60 +681,80 @@ fn invalidate_stale_cache(temp: &TempDir, fingerprint: &str, stem: &str) -> Resu
         .with_context(|| format!("write {}", temp.fingerprint_path.display()))
 }
 
-/// Waits until file size is stable across two checks. 200ms fast-path, then 2s polling, 300s timeout.
+/// Size and mtime have to hold still for 3 s: NFS caches attributes for `acregmin`,
+/// so a shorter look at the size alone reads the same value twice.
 async fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
     const TIMEOUT_SECS: u64 = 300;
+    const INTERVAL_SECS: u64 = 3;
 
-    let s0 = file_size(path);
-    if s0 == 0 {
-        bail!("file is empty or missing: {}", path.display());
-    }
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    if file_size(path) == s0 {
-        return Ok(());
+    let missing = || {
+        anyhow::Error::new(Transient)
+            .context(format!("file is empty or missing: {}", path.display()))
+    };
+
+    let mut state = file_state(path);
+    if state.0 == 0 {
+        return Err(missing());
     }
 
-    tracing::info!("[{stem}] file is still being written - waiting...");
     let deadline = tokio::time::Instant::now()
         + tokio::time::Duration::from_secs(TIMEOUT_SECS);
+    let mut announced = false;
 
     loop {
-        let s1 = file_size(path);
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        if file_size(path) == s1 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(INTERVAL_SECS)).await;
+        let next = file_state(path);
+        // Moved away mid-wait it reads as (0, None) twice, which compares as stable.
+        if next.0 == 0 {
+            return Err(missing());
+        }
+        if next == state {
             return Ok(());
         }
+        if !announced {
+            tracing::info!("[{stem}] file is still being written - waiting...");
+            announced = true;
+        }
+        state = next;
+
         if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "timed out after {TIMEOUT_SECS}s waiting for file to stabilize: {}",
+            return Err(anyhow::Error::new(Transient).context(format!(
+                "still growing after {TIMEOUT_SECS}s: {}",
                 path.display()
-            );
+            )));
         }
     }
 }
 
-fn file_size(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+/// The pair that has to hold still for a copy to be done.
+fn file_state(path: &Path) -> (u64, Option<std::time::SystemTime>) {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.len(), m.modified().ok()),
+        Err(_) => (0, None),
+    }
 }
 
-/// Cumulative source video byte sizes by frame, for the target-quality size cap.
-/// One ffprobe pass over the packets (no decoding); empty on failure (cap disabled).
-async fn probe_source_byte_index(source: &Path) -> Vec<u64> {
+/// Cumulative source bytes by frame; empty on failure, which disables the size cap.
+async fn probe_source_byte_index(source: &Path, stem: &str) -> Vec<u64> {
     #[derive(serde::Deserialize)]
     struct Packets { #[serde(default)] packets: Vec<Pkt> }
     #[derive(serde::Deserialize)]
     struct Pkt { #[serde(default)] size: Option<String> }
 
-    let parsed: Packets = match crate::ext::ffprobe_json(
+    // Demuxes the whole file, and a killed probe disables the cap silently.
+    const TIMEOUT_SECS: u64 = 3600;
+
+    let parsed: Packets = match crate::ext::ffprobe_json_with_timeout(
         &["-v", "error", "-select_streams", "v:0",
           "-show_entries", "packet=size", "-of", "json"],
         source,
+        TIMEOUT_SECS,
     )
     .await
     {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("source packet-size probe failed: {e:#} - size cap disabled");
+            tracing::warn!("[{stem}] source packet-size probe failed: {e:#} - size cap disabled");
             return Vec::new();
         }
     };
@@ -649,25 +806,151 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_with_profile() {
+        use crate::config::Encoder;
         let args = vec!["--crf".to_string(), "28".to_string()];
         let sc = SceneDetectionConfig::default();
-        let base = profile_fingerprint(&args, &opts(), &sc, None);
+        let enc = Some(Encoder::SvtAv1);
+        let base = profile_fingerprint(enc, &args, &opts(), &sc, None);
 
-        // identical inputs -> identical fingerprint
-        assert_eq!(base, profile_fingerprint(&args, &opts(), &sc, None));
+        assert_eq!(base, profile_fingerprint(enc, &args, &opts(), &sc, None));
 
-        // encoder-arg change -> different
+        // Resuming across a switch would merge one binary's chunks into the other's.
+        assert_ne!(base, profile_fingerprint(Some(Encoder::SvtAv1Hdr), &args, &opts(), &sc, None));
+
         let args2 = vec!["--crf".to_string(), "30".to_string()];
-        assert_ne!(base, profile_fingerprint(&args2, &opts(), &sc, None));
+        assert_ne!(base, profile_fingerprint(enc, &args2, &opts(), &sc, None));
 
-        // scale change -> different
         let mut o = opts();
         o.scale = Some((1920, 1080));
-        assert_ne!(base, profile_fingerprint(&args, &o, &sc, None));
+        assert_ne!(base, profile_fingerprint(enc, &args, &o, &sc, None));
 
-        // target_quality change -> different
         let tq = crate::config::TargetQualityConfig { jod: 9.6, ..Default::default() };
-        assert_ne!(base, profile_fingerprint(&args, &opts(), &sc, Some(&tq)));
+        assert_ne!(base, profile_fingerprint(enc, &args, &opts(), &sc, Some(&tq)));
     }
 }
 
+#[cfg(test)]
+mod failure_class_tests {
+    use super::*;
+
+    #[test]
+    fn transient_survives_both_construction_orders() {
+        // As a context on a real error, which is how a bad profile is reported.
+        let as_context = Err::<(), _>(anyhow::anyhow!("parse encode.toml"))
+            .context(Transient)
+            .unwrap_err();
+        assert!(is_transient(&as_context));
+
+        // As the base error, which is how wait_for_stable reports an unfinished copy.
+        let as_base = anyhow::Error::new(Transient).context("file is empty or missing");
+        assert!(is_transient(&as_base));
+
+        let wrapped = Err::<(), _>(as_base).context("run job").unwrap_err();
+        assert!(is_transient(&wrapped));
+    }
+
+    #[test]
+    fn a_rejected_profile_is_transient_through_the_real_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let toml = dir.path().join("encode.toml");
+        std::fs::write(&toml, "encoder = \"svt-av1\"\n[avxs]\nscale = 0\n").unwrap();
+
+        let err = Config::from_file(&toml).context(Transient).unwrap_err();
+        assert!(err.to_string().contains("retrying") || format!("{err:#}").contains("scale"));
+        assert!(is_transient(&err), "got: {err:#}");
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_transient() {
+        let err = Err::<(), _>(anyhow::anyhow!("encoder failed"))
+            .context("chunk 00007")
+            .unwrap_err();
+        assert!(!is_transient(&err));
+    }
+}
+
+#[cfg(test)]
+mod output_param_tests {
+    use super::*;
+
+    #[test]
+    fn crop_is_normalized_before_anything_downstream_sees_it() {
+        // Unrounded, the metric tool and the encoder compared frames a line apart.
+        let (scale, crop, vf) = compute_output_params(1920, 1080, Some("crop=1920:801:0:141"), None, "t");
+        let crop = crop.expect("crop should survive normalization");
+        assert_eq!((crop.w, crop.h, crop.x, crop.y), (1920, 800, 0, 140));
+        assert_eq!(vf.as_deref(), Some("crop=1920:800:0:140"));
+        assert_eq!(scale, None);
+    }
+
+    #[test]
+    fn crop_larger_than_the_source_is_dropped() {
+        let (_, crop, vf) = compute_output_params(1280, 720, Some("crop=1920:800:0:140"), None, "t");
+        assert_eq!(crop, None);
+        assert_eq!(vf, None);
+    }
+
+    #[test]
+    fn scale_applies_to_the_cropped_size_and_keeps_even_edges() {
+        let (scale, crop, vf) = compute_output_params(1920, 1080, Some("crop=1920:800:0:140"), Some(400), "t");
+        assert_eq!(crop.map(|c| (c.w, c.h)), Some((1920, 800)));
+        assert_eq!(scale, Some((960, 400)));
+        assert_eq!(vf.as_deref(), Some("crop=1920:800:0:140,scale=960:400"));
+    }
+
+    #[test]
+    fn scale_above_the_source_height_is_not_an_upscale() {
+        let (scale, _, vf) = compute_output_params(1280, 720, None, Some(1080), "t");
+        assert_eq!(scale, None);
+        assert_eq!(vf, None);
+    }
+
+    #[test]
+    fn archiving_never_overwrites_an_earlier_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = dir.path().join("Episode 01.mkv");
+
+        assert_eq!(free_path(&first).unwrap(), first);
+
+        std::fs::write(&first, b"season 1").unwrap();
+        let second = free_path(&first).unwrap();
+        assert_eq!(second, dir.path().join("Episode 01.2.mkv"));
+
+        std::fs::write(&second, b"season 2").unwrap();
+        assert_eq!(free_path(&first).unwrap(), dir.path().join("Episode 01.3.mkv"));
+
+        assert_eq!(std::fs::read(&first).unwrap(), b"season 1");
+    }
+
+    #[tokio::test]
+    async fn a_source_that_disappears_mid_wait_is_transient() {
+        // The file is fine; a marker would lock it out for good once it came back.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("film.mkv");
+        std::fs::write(&path, b"data").unwrap();
+
+        let gone = path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            std::fs::remove_file(&gone).unwrap();
+        });
+
+        let err = wait_for_stable(&path, "film").await.unwrap_err();
+        assert!(is_transient(&err), "got: {err:#}");
+    }
+
+    #[test]
+    fn a_timeout_is_transient_but_a_bad_profile_stays_permanent() {
+        let timeout = anyhow::Error::new(Transient).context("ffprobe did not finish within 120s");
+        assert!(is_transient(&timeout.context("HDR detection")));
+
+        let disk_full = anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::StorageFull,
+        ))
+        .context("write chunk");
+        assert!(is_transient(&disk_full));
+
+        let real = anyhow::anyhow!("encoder exited with status 1");
+        assert!(!is_transient(&real.context("encode chunk 3")));
+    }
+}

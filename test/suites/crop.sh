@@ -24,6 +24,8 @@ assert_file_exists     "$O/.avxs_test/crop.cache"
 [ -s "$O/.avxs_test/crop.cache" ] || fail "crop.cache is empty after detection"
 
 # -- clean source: cropdetect finds no bars, height unchanged -----------------
+# 360 is not a multiple of 16: rounding the box to 16 reports 640x352 for a frame with no
+# bars, and that passes the "did this change anything" check as a real crop.
 I="$WORKDIR/2/in"; O="$WORKDIR/2/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -53,8 +55,11 @@ keep_temp = true
 EOF
 run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "crop cache: no output"
 assert_log_contains "(cached)"
+# The cached value has to reach the encode, not just the log line.
+assert_video_height "$O/test.mkv" 360
 
-# -- crop + scale: result is <=240 (cropdetect round=16 may give 352, not 360) -
+# -- crop + scale: crop runs first, the scale target applies to what is left ---
+# <=, not ==: what has to hold is "no taller than asked for", whatever cropdetect reports.
 I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_blackbars.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'

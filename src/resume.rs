@@ -5,21 +5,34 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
-/// Reads a JSON file, or returns the default if it does not exist.
+/// Missing or empty reads as the default; the fingerprint would never clear a leftover.
 fn load_json_or_default<T: DeserializeOwned + Default>(path: &Path, what: &str) -> Result<T> {
-    if !path.exists() {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) => return Err(e).with_context(|| format!("read {what}: {}", path.display())),
+    };
+    if raw.trim().is_empty() {
+        tracing::warn!("{} is empty - starting {what} over", path.display());
         return Ok(T::default());
     }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read {what}: {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parse {what}: {}", path.display()))
 }
 
-/// Writes JSON via a temp file + rename so a crash never leaves a half-written file.
+/// Temp file + rename, flushed first, or a power loss leaves zero bytes behind.
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    use std::io::Write;
+
     let json = serde_json::to_string_pretty(value)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json).with_context(|| format!("write {}", tmp.display()))?;
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(json.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("flush {} to disk", tmp.display()))?;
+    }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
 }
@@ -49,9 +62,7 @@ pub fn read_scenes(path: &Path) -> Result<Vec<SceneEntry>> {
 }
 
 pub fn write_scenes(path: &Path, scenes: &[SceneEntry]) -> Result<()> {
-    let json = serde_json::to_string_pretty(scenes)?;
-    std::fs::write(path, json)
-        .with_context(|| format!("write scenes.json: {}", path.display()))
+    write_json_atomic(path, &scenes)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -122,9 +133,13 @@ pub struct TempDir {
     pub done_path: PathBuf,
     pub tq_path: PathBuf,
     pub fingerprint_path: PathBuf,
+    pub source_id_path: PathBuf,
     pub failed_path: PathBuf,
     pub chunks_dir: PathBuf,
     pub crop_cache: PathBuf,
+    pub audio_path: PathBuf,
+    pub video_path: PathBuf,
+    pub mux_path: PathBuf,
 }
 
 impl TempDir {
@@ -135,12 +150,17 @@ impl TempDir {
         let done_path        = path.join("done.json");
         let tq_path          = path.join("tq.json");
         let fingerprint_path = path.join("profile.fingerprint");
+        let source_id_path   = path.join("source.path");
         let failed_path      = path.join(".failed");
         let chunks_dir       = path.join("chunks");
         let crop_cache       = path.join("crop.cache");
+        let audio_path       = path.join("audio.mkv");
+        let video_path       = path.join("video.mkv");
+        let mux_path         = path.join("muxed.mkv");
         Self {
             path, index_path, scenes_path, done_path, tq_path,
-            fingerprint_path, failed_path, chunks_dir, crop_cache,
+            fingerprint_path, source_id_path, failed_path, chunks_dir, crop_cache,
+            audio_path, video_path, mux_path,
         }
     }
 
@@ -151,5 +171,75 @@ impl TempDir {
 
     pub fn chunk_path(&self, key: &str) -> PathBuf {
         self.chunks_dir.join(format!("{key}.ivf"))
+    }
+
+    /// The source this temp dir was built for, as recorded by `claim_source`.
+    pub fn recorded_source(&self) -> Option<String> {
+        std::fs::read_to_string(&self.source_id_path)
+            .ok()
+            .map(|s| s.trim().to_owned())
+    }
+
+    /// A different source with the same stem wipes the dir; it describes the old video.
+    pub fn claim_source(&self, source: &Path, stem: &str) -> Result<()> {
+        let id = source.display().to_string();
+        if self.recorded_source().is_some_and(|prev| prev != id) {
+            tracing::warn!("[{stem}] temp dir belongs to a different source - discarding it");
+            std::fs::remove_dir_all(&self.path)
+                .with_context(|| format!("remove stale temp dir: {}", self.path.display()))?;
+        }
+        self.create_dirs()?;
+        std::fs::write(&self.source_id_path, &id)
+            .with_context(|| format!("write {}", self.source_id_path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scenes(n: usize) -> Vec<SceneEntry> {
+        (0..n)
+            .map(|i| SceneEntry {
+                index: i,
+                start_frame: i as u64 * 10,
+                end_frame: i as u64 * 10 + 9,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_shorter_rewrite_leaves_no_tail_and_no_temp_file() {
+        // In place, the second write would leave the tail of the first behind.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("scenes.json");
+
+        write_scenes(&path, &scenes(50)).unwrap();
+        assert_eq!(read_scenes(&path).unwrap().len(), 50);
+
+        write_scenes(&path, &scenes(1)).unwrap();
+        let back = read_scenes(&path).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].end_frame, 9);
+
+        assert!(!path.with_extension("json.tmp").exists(), "scratch file left behind");
+    }
+
+    #[test]
+    fn a_missing_or_empty_state_file_reads_as_the_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("done.json");
+
+        let done: DoneState = load_json_or_default(&path, "done.json").unwrap();
+        assert!(done.chunks.is_empty());
+
+        // What a crash between create and flush leaves behind.
+        std::fs::write(&path, b"").unwrap();
+        let done: DoneState = load_json_or_default(&path, "done.json").unwrap();
+        assert!(done.chunks.is_empty());
+
+        // Garbage is a different matter and still has to be reported.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(load_json_or_default::<DoneState>(&path, "done.json").is_err());
     }
 }

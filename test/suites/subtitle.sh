@@ -46,6 +46,26 @@ language_whitelist = ["deu"]
 EOF
 run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "whitelist: no output"
 assert_subtitle_track_count "$O/test.mkv" 1
+# Counting alone would pass with the English track kept. mkvmerge writes the
+# bibliographic form, so "deu" comes back out as "ger".
+assert_subtitle_language    "$O/test.mkv" 0 ger
+
+# -- whitelist written in the other ISO 639-2 spelling still matches ----------
+# The everyday case: feeding an avxs output back into the profile that produced it.
+I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
+ffmpeg -y -hide_banner -loglevel error -i "$FIXTURES_DIR/sdr_subtitles.mkv" \
+    -map 0 -c copy -metadata:s:s:1 language=ger "$I/p/test.mkv" \
+    || fail "could not build ger-tagged fixture"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[subtitles]
+language_whitelist = ["deu"]
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "iso alias: no output"
+assert_subtitle_track_count "$O/test.mkv" 1
 
 # -- source without subtitles + copy: 0 tracks, no error ----------------------
 I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"

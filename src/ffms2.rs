@@ -74,10 +74,11 @@ pub struct FFMS_Frame {
 
 #[repr(C)]
 pub struct FFMS_VideoProperties {
-    pub fps_numerator: c_int,
+    // Denominator first, in both pairs. ffms.h really is ordered that way.
     pub fps_denominator: c_int,
-    pub rff_numerator: c_int,
+    pub fps_numerator: c_int,
     pub rff_denominator: c_int,
+    pub rff_numerator: c_int,
     pub num_frames: c_int,
     pub sar_num: c_int,
     pub sar_den: c_int,
@@ -174,9 +175,8 @@ pub fn get_pixel_format(name: &str) -> c_int {
     unsafe { FFMS_GetPixFmt(cname.as_ptr()) }
 }
 
-/// Crop region in crop=W:H:X:Y order (ffmpeg convention).
-/// Applied in the Y4M pipe so the encoder only sees the cropped frame.
-#[derive(Debug, Clone, Copy)]
+/// crop=W:H:X:Y, applied in the Y4M pipe so the encoder only sees the cropped frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Crop {
     pub w: u32,
     pub h: u32,
@@ -198,6 +198,105 @@ impl Crop {
             x: p[2].parse().ok()?,
             y: p[3].parse().ok()?,
         })
+    }
+
+    /// Even edges, inside the source. The single check; Y4M pointer arithmetic,
+    /// half-sized chroma and FFVship's edge offsets all rely on it.
+    pub fn normalized(self, src_w: u32, src_h: u32) -> Option<Self> {
+        let c = Crop { w: self.w & !1, h: self.h & !1, x: self.x & !1, y: self.y & !1 };
+        if c.w == 0 || c.h == 0 {
+            return None;
+        }
+        if c.x.checked_add(c.w)? > src_w || c.y.checked_add(c.h)? > src_h {
+            return None;
+        }
+        Some(c)
+    }
+
+    pub fn to_filter(self) -> String {
+        format!("crop={}:{}:{}:{}", self.w, self.h, self.x, self.y)
+    }
+
+    /// Smallest rectangle containing both, so no sample's content is cut away.
+    pub fn union(self, other: Self) -> Self {
+        // Runs on raw cropdetect output, before `normalized` rejects anything.
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right  = self.x.saturating_add(self.w).max(other.x.saturating_add(other.w));
+        let bottom = self.y.saturating_add(self.h).max(other.y.saturating_add(other.h));
+        Crop { w: right - x, h: bottom - y, x, y }
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::Crop;
+
+    fn c(w: u32, h: u32, x: u32, y: u32) -> Crop {
+        Crop { w, h, x, y }
+    }
+
+    #[test]
+    fn parses_both_spellings_and_rejects_short_lists() {
+        assert_eq!(Crop::from_str("crop=640:360:0:60"), Some(c(640, 360, 0, 60)));
+        assert_eq!(Crop::from_str("640:360:0:60"), Some(c(640, 360, 0, 60)));
+        assert_eq!(Crop::from_str("640:360"), None);
+        assert_eq!(Crop::from_str("640:360:0:60:8"), None);
+    }
+
+    #[test]
+    fn normalize_rounds_every_edge_to_even() {
+        assert_eq!(c(641, 361, 1, 61).normalized(1920, 1080), Some(c(640, 360, 0, 60)));
+    }
+
+    #[test]
+    fn normalize_rejects_a_rectangle_outside_the_source() {
+        // The crop cache is plain text and survives a profile change.
+        assert_eq!(c(1920, 800, 0, 140).normalized(1280, 720), None);
+        assert_eq!(c(640, 360, 700, 0).normalized(1280, 720), None);
+        assert_eq!(c(0, 360, 0, 0).normalized(1280, 720), None);
+        assert_eq!(c(u32::MAX, 2, 4, 0).normalized(1280, 720), None);
+    }
+
+    #[test]
+    fn normalize_accepts_a_crop_that_exactly_fills_the_source() {
+        assert_eq!(c(1280, 720, 0, 0).normalized(1280, 720), Some(c(1280, 720, 0, 0)));
+    }
+
+    #[test]
+    fn union_covers_both_samples() {
+        // One sample sees bars, another sees content lower down.
+        assert_eq!(c(640, 360, 0, 60).union(c(640, 400, 0, 40)), c(640, 400, 0, 40));
+        assert_eq!(c(600, 360, 20, 60).union(c(640, 360, 0, 60)), c(640, 360, 0, 60));
+    }
+
+    #[test]
+    fn to_filter_round_trips() {
+        let crop = c(640, 360, 0, 60);
+        assert_eq!(crop.to_filter(), "crop=640:360:0:60");
+        assert_eq!(Crop::from_str(&crop.to_filter()), Some(crop));
+    }
+
+    #[test]
+    fn chroma_planes_match_what_a_y4m_reader_expects() {
+        use super::{PixelSubsampling, VideoSource};
+
+        // 853x480 4:2:0 needs 427x240 chroma; 426 columns puts every frame 480 bytes short.
+        let geom = |ss, w, h| {
+            let (cw, ch, _, _) = VideoSource::chroma_geometry(ss, w, h, 0, 0);
+            (cw, ch)
+        };
+        assert_eq!(geom(PixelSubsampling::Yuv420, 853, 480), (427, 240));
+        assert_eq!(geom(PixelSubsampling::Yuv420, 1920, 1080), (960, 540));
+        assert_eq!(geom(PixelSubsampling::Yuv420, 640, 361), (320, 181));
+        assert_eq!(geom(PixelSubsampling::Yuv422, 853, 480), (427, 480));
+        assert_eq!(geom(PixelSubsampling::Yuv444, 853, 481), (853, 481));
+
+        // An even crop keeps the chroma offset exact, which is why odd edges are rejected.
+        assert_eq!(
+            VideoSource::chroma_geometry(PixelSubsampling::Yuv420, 640, 360, 20, 60),
+            (320, 180, 10, 30)
+        );
     }
 }
 
@@ -397,8 +496,7 @@ impl VideoSource {
         let out_h = unsafe { (*first_frame).encoded_height };
         let resizer = FFMS_RESIZER_BICUBIC;
 
-        // SVT-AV1 accepts only 8/10-bit input. Honor an explicit override, otherwise
-        // clamp sources deeper than 10-bit (12/16) down to 10-bit so they still encode.
+        // SVT-AV1 accepts only 8/10-bit input, so 12/16-bit sources are clamped.
         let target_depth = opts.target_bit_depth
             .or((pixel_format.bit_depth > 10).then_some(10u8));
 
@@ -455,6 +553,23 @@ impl VideoSource {
         Ok(VideoSource { ptr, info })
     }
 
+    /// div_ceil: a Y4M reader takes ceil(w/2) x ceil(h/2) from the header.
+    fn chroma_geometry(
+        subsampling: PixelSubsampling,
+        out_w: usize,
+        out_h: usize,
+        crop_x: usize,
+        crop_y: usize,
+    ) -> (usize, usize, usize, usize) {
+        match subsampling {
+            PixelSubsampling::Yuv420 => {
+                (out_w.div_ceil(2), out_h.div_ceil(2), crop_x / 2, crop_y / 2)
+            }
+            PixelSubsampling::Yuv422 => (out_w.div_ceil(2), out_h, crop_x / 2, crop_y),
+            PixelSubsampling::Yuv444 => (out_w, out_h, crop_x, crop_y),
+        }
+    }
+
     pub fn write_y4m_range<W: Write>(
         &mut self,
         writer: &mut W,
@@ -470,15 +585,17 @@ impl VideoSource {
             "0:0".to_string()
         };
 
-        // Output dimensions: cropped if requested, full otherwise.
-        // Crop offsets are rounded down to even for correct chroma alignment (YUV420/422).
+        // Raw pointer arithmetic below, so a crop that does not fit reads past the buffer.
         let (out_w, out_h, crop_x, crop_y) = match crop {
-            Some(c) => (
-                c.w as usize,
-                c.h as usize,
-                (c.x & !1) as usize,
-                (c.y & !1) as usize,
-            ),
+            Some(c) => {
+                if c.normalized(info.width, info.height) != Some(c) {
+                    bail!(
+                        "crop {}:{}:{}:{} does not fit source {}x{} (or has odd edges)",
+                        c.w, c.h, c.x, c.y, info.width, info.height
+                    );
+                }
+                (c.w as usize, c.h as usize, c.x as usize, c.y as usize)
+            }
             None => (info.width as usize, info.height as usize, 0, 0),
         };
 
@@ -491,17 +608,7 @@ impl VideoSource {
         let bps = info.pixel_format.bytes_per_sample();
 
         let (chroma_out_w, chroma_out_h, chroma_cx, chroma_cy) =
-            match info.pixel_format.subsampling {
-                PixelSubsampling::Yuv420 => {
-                    (out_w / 2, out_h / 2, crop_x / 2, crop_y / 2)
-                }
-                PixelSubsampling::Yuv422 => {
-                    (out_w / 2, out_h, crop_x / 2, crop_y)
-                }
-                PixelSubsampling::Yuv444 => {
-                    (out_w, out_h, crop_x, crop_y)
-                }
-            };
+            Self::chroma_geometry(info.pixel_format.subsampling, out_w, out_h, crop_x, crop_y);
 
         let mut ei = ErrorInfo::new();
         for frame_n in start..=end {
@@ -545,18 +652,23 @@ impl VideoSource {
 }
 
 pub async fn run_ffmsindex(source_file: &Path, index_file: &Path) -> Result<()> {
-    let out = tokio::process::Command::new(external_bin("ffmsindex"))
-        .arg("-f")
-        .arg(source_file)
-        .arg(index_file)
-        .output()
-        .await
-        .context("start ffmsindex")?;
+    const TIMEOUT_SECS: u64 = 3600;
+
+    // Scratch name: the next run would read a partial file as "reusing existing index".
+    let tmp = index_file.with_extension("ffindex.part");
+    let _ = std::fs::remove_file(&tmp);
+
+    let mut cmd = tokio::process::Command::new(external_bin("ffmsindex"));
+    cmd.arg("-f").arg(source_file).arg(&tmp);
+    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmsindex").await?;
 
     if !out.status.success() {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let _ = std::fs::remove_file(&tmp);
         bail!("ffmsindex failed:\n{stdout}{stderr}");
     }
-    Ok(())
+
+    std::fs::rename(&tmp, index_file)
+        .with_context(|| format!("rename {} to {}", tmp.display(), index_file.display()))
 }

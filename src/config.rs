@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub encoder: Option<Encoder>,
     #[serde(default)]
@@ -36,6 +37,7 @@ pub enum VideoMode {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AvxsConfig {
     #[serde(default)]
     pub video: VideoMode,
@@ -52,6 +54,7 @@ pub struct AvxsConfig {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SubtitleConfig {
     #[serde(default)]
     pub mode: SubtitleMode,
@@ -68,6 +71,7 @@ pub enum SubtitleMode {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AudioConfig {
     #[serde(default)]
     pub mode: AudioMode,
@@ -85,6 +89,7 @@ pub struct AudioConfig {
 
 /// Override whose unset fields inherit from [audio].
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AudioProfile {
     pub mode: Option<AudioMode>,
     pub codec: Option<String>,
@@ -142,6 +147,65 @@ pub fn layout_name(channels: u32) -> &'static str {
     }
 }
 
+/// ISO 639-2 spells ~20 languages twice: `ger` in Matroska, `deu` in a config.
+fn iso639_alias(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "alb" => "sqi", "sqi" => "alb",
+        "arm" => "hye", "hye" => "arm",
+        "baq" => "eus", "eus" => "baq",
+        "bur" => "mya", "mya" => "bur",
+        "chi" => "zho", "zho" => "chi",
+        "cze" => "ces", "ces" => "cze",
+        "dut" => "nld", "nld" => "dut",
+        "fre" => "fra", "fra" => "fre",
+        "geo" => "kat", "kat" => "geo",
+        "ger" => "deu", "deu" => "ger",
+        "gre" => "ell", "ell" => "gre",
+        "ice" => "isl", "isl" => "ice",
+        "mac" => "mkd", "mkd" => "mac",
+        "mao" => "mri", "mri" => "mao",
+        "may" => "msa", "msa" => "may",
+        "per" => "fas", "fas" => "per",
+        "rum" => "ron", "ron" => "rum",
+        "slo" => "slk", "slk" => "slo",
+        "tib" => "bod", "bod" => "tib",
+        "wel" => "cym", "cym" => "wel",
+        _ => return None,
+    })
+}
+
+/// Case-insensitive, alias-aware, subtags ignored. Same code set only: `de-DE` is not `ger`.
+pub fn language_matches(entry: &str, tag: &str) -> bool {
+    let base_of = |s: &str| {
+        s.trim()
+            .to_ascii_lowercase()
+            .split(['-', '_'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let entry = base_of(entry);
+    let tag = base_of(tag);
+
+    !entry.is_empty()
+        && (entry == tag || iso639_alias(&entry).is_some_and(|a| a == tag))
+}
+
+/// Empty whitelist or untagged track keeps everything; MP4 spells untagged `und`.
+pub fn language_selected(whitelist: &[String], tag: Option<&str>) -> bool {
+    if whitelist.is_empty() {
+        return true;
+    }
+    let tagged = tag
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("und"));
+
+    match tagged {
+        None => true,
+        Some(lang) => whitelist.iter().any(|w| language_matches(w, lang)),
+    }
+}
+
 /// True if the output codec is lossless (bitrate then irrelevant).
 pub fn output_is_lossless(codec: &str) -> bool {
     matches!(codec, "flac" | "alac" | "wavpack" | "tta") || codec.starts_with("pcm_")
@@ -196,11 +260,11 @@ pub enum SceneDetectionSpeedConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct SceneDetectionConfig {
     /// Minimum number of frames between scene cuts.
     pub min_scene_len: usize,
-    /// Maximum scene length in seconds before an extra split is inserted.
-    /// Set to 0 to disable. Ignored when `extra_split` > 0.
+    /// Max chunk length in seconds; 0 disables it, `extra_split` > 0 overrides it.
     pub extra_split_sec: u32,
     /// Maximum scene length in frames. Overrides `extra_split_sec` when > 0. Set to 0 to disable.
     pub extra_split: u32,
@@ -223,6 +287,30 @@ impl Default for SceneDetectionConfig {
 }
 
 impl SceneDetectionConfig {
+    /// Only used after indexing and detection, so a bad value would cost minutes first.
+    fn validate(&self) -> Result<()> {
+        if self.min_scene_len == 0 {
+            bail!("scene_detection.min_scene_len must be >= 1");
+        }
+        // One encoder process and one resume entry per frame otherwise.
+        if self.extra_split > 0 && self.extra_split < 24 {
+            bail!(
+                "scene_detection.extra_split must be >= 24 frames (got {}); use 0 to disable",
+                self.extra_split
+            );
+        }
+        if let Some(h) = self.downscale_height {
+            // A zero edge reads as "keep the input size" to ffmpeg, same as avxs.scale.
+            if h < 64 {
+                bail!(
+                    "scene_detection.downscale_height must be at least 64 (got {h}); \
+                     remove it to disable the extra downscale"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the effective max chunk size in frames, or None if extra splitting is disabled.
     pub fn effective_extra_split_frames(&self, fps: f64) -> Option<usize> {
         if self.extra_split > 0 {
@@ -238,6 +326,7 @@ impl SceneDetectionConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct TargetQualityConfig {
     /// CVVDP JOD score to hold as a hard minimum per chunk. 0 is rejected by validate().
     pub jod: f64,
@@ -270,6 +359,14 @@ impl Default for TargetQualityConfig {
 }
 
 impl Config {
+    /// Parse and validate without a file; same path as `from_file` from the parse on.
+    #[cfg(test)]
+    pub fn from_str_for_test(raw: &str) -> Result<Self> {
+        let cfg: Config = toml::from_str(raw).context("parse encode.toml")?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read encode.toml: {}", path.display()))?;
@@ -288,12 +385,22 @@ impl Config {
         {
             bail!("avxs.bit_depth must be 8 or 10 (got {d})");
         }
+        // A zero edge reads as "keep the input size" to ffmpeg.
+        if let Some(h) = self.avxs.scale
+            && h < 64
+        {
+            bail!("avxs.scale must be at least 64 (got {h}); remove it to disable scaling");
+        }
         if let Some(tq) = &self.target_quality {
             if self.avxs.video == VideoMode::Copy {
                 bail!("target_quality requires avxs.video = \"encode\"");
             }
-            if !(tq.jod > 0.0 && tq.jod <= 10.0) {
-                bail!("target_quality.jod must be in (0, 10] (got {})", tq.jod);
+            if tq.jod == 0.0 {
+                bail!("target_quality.jod is required: the CVVDP JOD floor to hold, in (0, 10)");
+            }
+            if !(tq.jod > 0.0 && tq.jod < 10.0) {
+                // 10 is the top of the scale, reachable only by an identical image.
+                bail!("target_quality.jod must be in (0, 10) (got {})", tq.jod);
             }
             if tq.min_crf < 1 {
                 bail!("target_quality.min_crf must be >= 1 (got {})", tq.min_crf);
@@ -313,13 +420,18 @@ impl Config {
             if tq.probe_preset > 13 {
                 bail!("target_quality.probe_preset must be 0..=13 (got {})", tq.probe_preset);
             }
-            if tq.tolerance < 0.0 {
-                bail!("target_quality.tolerance must be >= 0 (got {})", tq.tolerance);
+            // TOML accepts `nan`, and every comparison against it is false.
+            if !tq.tolerance.is_finite() || tq.tolerance < 0.0 {
+                bail!("target_quality.tolerance must be a finite value >= 0 (got {})", tq.tolerance);
             }
-            if tq.max_encoded_percent <= 0.0 {
-                bail!("target_quality.max_encoded_percent must be > 0 (got {})", tq.max_encoded_percent);
+            if !tq.max_encoded_percent.is_finite() || tq.max_encoded_percent <= 0.0 {
+                bail!(
+                    "target_quality.max_encoded_percent must be a finite value > 0 (got {})",
+                    tq.max_encoded_percent
+                );
             }
         }
+        self.scene_detection.validate()?;
         validate_audio("audio", self.audio.mode, self.audio.codec.as_deref(), self.audio.bitrate.as_ref())?;
         if let Some(p) = &self.audio.lossless {
             let r = self.audio.overlay(p);
@@ -346,6 +458,7 @@ impl Config {
 
 /// Encode needs a codec; lossy codecs also need a bitrate.
 fn validate_audio(ctx: &str, mode: AudioMode, codec: Option<&str>, bitrate: Option<&Bitrate>) -> Result<()> {
+    validate_bitrate_keys(ctx, bitrate)?;
     if mode != AudioMode::Encode {
         return Ok(());
     }
@@ -354,6 +467,23 @@ fn validate_audio(ctx: &str, mode: AudioMode, codec: Option<&str>, bitrate: Opti
     };
     if !output_is_lossless(codec) && bitrate.is_none() {
         bail!("{ctx}: bitrate required when mode = encode ({codec} is lossy)");
+    }
+    Ok(())
+}
+
+/// A plain table, so `deny_unknown_fields` cannot reach its keys.
+fn validate_bitrate_keys(ctx: &str, bitrate: Option<&Bitrate>) -> Result<()> {
+    let Some(Bitrate::PerLayout(map)) = bitrate else {
+        return Ok(());
+    };
+    for key in map.keys() {
+        let known = key == "default" || (0..=8).any(|c| layout_name(c) == key);
+        if !known {
+            bail!(
+                "{ctx}: unknown bitrate layout \"{key}\"; \
+                 expected one of mono, stereo, 3.0, quad, 5.0, 5.1, 6.1, 7.1, default"
+            );
+        }
     }
     Ok(())
 }
@@ -507,5 +637,112 @@ mod tests {
         )
         .unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn language_whitelist_matches_both_iso_639_2_spellings() {
+        // Matroska tends to carry the bibliographic code, configs the terminological one.
+        assert!(language_matches("deu", "ger"));
+        assert!(language_matches("ger", "deu"));
+        assert!(language_matches("fra", "fre"));
+        assert!(language_matches("zho", "chi"));
+        assert!(language_matches("deu", "deu"));
+        assert!(!language_matches("deu", "eng"));
+        // Arabic and Armenian share a two-letter prefix; a prefix match would confuse them.
+        assert!(!language_matches("ara", "arm"));
+    }
+
+    #[test]
+    fn language_whitelist_ignores_case_and_region_suffix() {
+        assert!(language_matches("POR", "por-BR"));
+        assert!(language_matches("pt", "pt-BR"));
+        assert!(language_matches("por", "por"));
+        assert!(language_matches(" eng ", "eng"));
+        assert!(!language_matches("por", "spa"));
+        assert!(language_matches("por-BR", "por"));
+        assert!(language_matches("por_BR", "por-PT"));
+        assert!(language_matches("deu-DE", "ger"));
+        // Same code set on both sides, subtag or not.
+        assert!(!language_matches("por", "pt-BR"));
+        assert!(!language_matches("de-DE", "ger"));
+        assert!(!language_matches("", "eng"));
+    }
+
+    #[test]
+    fn scene_detection_values_are_checked_before_the_encode_starts() {
+        let bad = |toml: &str| {
+            Config::from_str_for_test(toml)
+                .unwrap_err()
+                .to_string()
+        };
+        let sd = |body: &str| format!("encoder = \"svt-av1\"\n[scene_detection]\n{body}");
+        assert!(bad(&sd("min_scene_len = 0")).contains("min_scene_len"));
+        assert!(bad(&sd("extra_split = 1")).contains("extra_split"));
+        assert!(bad(&sd("downscale_height = 0")).contains("downscale_height"));
+
+        Config::from_str_for_test(&sd("extra_split = 240\ndownscale_height = 720")).unwrap();
+    }
+
+    #[test]
+    fn non_finite_target_quality_values_are_rejected() {
+        let bad = |toml: &str| Config::from_str_for_test(toml).unwrap_err().to_string();
+        let base = "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\n";
+        assert!(bad(&format!("{base}max_encoded_percent = nan")).contains("max_encoded_percent"));
+        assert!(bad(&format!("{base}max_encoded_percent = inf")).contains("max_encoded_percent"));
+        assert!(bad(&format!("{base}tolerance = nan")).contains("tolerance"));
+    }
+
+    #[test]
+    fn unknown_bitrate_layout_keys_are_rejected() {
+        let toml ="encoder = \"svt-av1\"\n[audio]\nmode = \"encode\"\ncodec = \"libopus\"\n\
+                    bitrate = { stereo = \"192k\", \"5,1\" = \"320k\" }";
+        let err = Config::from_str_for_test(toml).unwrap_err().to_string();
+        assert!(err.contains("5,1"), "got: {err}");
+
+        Config::from_str_for_test(
+            "encoder = \"svt-av1\"\n[audio]\nmode = \"encode\"\ncodec = \"libopus\"\n\
+             bitrate = { stereo = \"192k\", \"5.1\" = \"320k\", default = \"128k\" }",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn und_counts_as_untagged_not_as_a_language() {
+        let wl = vec!["eng".to_string()];
+        assert!(language_selected(&wl, None));
+        assert!(language_selected(&wl, Some("und")));
+        assert!(language_selected(&wl, Some("UND")));
+        assert!(language_selected(&wl, Some("")));
+        assert!(language_selected(&wl, Some("eng")));
+        assert!(!language_selected(&wl, Some("ger")));
+        assert!(language_selected(&[], Some("ger")));
+    }
+
+    #[test]
+    fn scale_below_the_minimum_is_rejected() {
+        for bad in [0u32, 1, 63] {
+            let c: Config = toml::from_str(&format!(
+                "encoder = \"svt-av1\"\n[avxs]\nscale = {bad}\n"
+            ))
+            .unwrap();
+            assert!(c.validate().is_err(), "scale = {bad} should be rejected");
+        }
+        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[avxs]\nscale = 720\n").unwrap();
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_rather_than_ignored() {
+        // A misspelled section used to parse as "feature not configured".
+        assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_qualtiy]\njod = 9.5\n").is_err());
+        assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[avxs]\nbitdepth = 10\n").is_err());
+        assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_quality]\nmax_probe = 2\n").is_err());
+    }
+
+    #[test]
+    fn missing_jod_is_named_as_missing() {
+        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[target_quality]\nmin_crf = 10\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("jod is required"), "got: {err}");
     }
 }

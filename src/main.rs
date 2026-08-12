@@ -40,6 +40,8 @@ async fn main() -> Result<()> {
         output_dir: output_dir.clone(),
     };
 
+    let mut shutdown = shutdown_signal();
+
     loop {
         let in_dir  = input_dir.clone();
         let out_dir = output_dir.clone();
@@ -60,12 +62,54 @@ async fn main() -> Result<()> {
                     if let Err(e) = job::run(j, &ctx).await {
                         job::handle_failure(j, &ctx, stem, &e);
                     }
+                    if *shutdown.borrow() {
+                        tracing::info!("stopping after {stem}");
+                        return Ok(());
+                    }
                 }
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(poll_interval)).await;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(poll_interval)) => {}
+            // Ok only: `changed()` also resolves once the sender is gone.
+            Ok(()) = shutdown.changed() => return Ok(()),
+        }
     }
+}
+
+/// Ends the scan loop between jobs. Killed instead, the orphaned encoders keep writing
+/// chunk files the restarted instance starts writing too.
+fn shutdown_signal() -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let (Ok(mut term), Ok(mut int)) =
+                (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
+            else {
+                tracing::error!("could not install signal handlers - avxs will keep running on SIGTERM until it is killed");
+                return;
+            };
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        tracing::info!("signal received - finishing the current job, then stopping");
+        let _ = tx.send(true);
+    });
+
+    rx
 }
 
 fn init_logging() {

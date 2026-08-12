@@ -38,7 +38,9 @@ fn run_detection(
     let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
     cmd.args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
-        .arg(source_file);
+        .arg(source_file)
+        // The track FFMS2 opens; ffmpeg's own pick is by resolution.
+        .args(["-map", "0:v:0"]);
 
     if let Some(ref vf) = actual_vf {
         cmd.args(["-vf", vf]);
@@ -46,6 +48,8 @@ fn run_detection(
 
     let mut ffmpeg = cmd
         .args(["-pix_fmt", "yuv420p"])
+        // yuv4mpegpipe is not a VFR muxer: without this, frames are dropped or doubled.
+        .args(["-fps_mode", "passthrough"])
         .args(["-f", "yuv4mpegpipe", "pipe:1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -65,16 +69,27 @@ fn run_detection(
     };
     let reader: Box<dyn Read> = Box::new(BufReader::new(stdout));
 
+    // ffmpeg's message is the only useful part of an "init y4m decoder" failure.
+    let abort = |mut ffmpeg: std::process::Child, handle: std::thread::JoinHandle<String>, e: anyhow::Error| {
+        let _ = ffmpeg.kill();
+        let _ = ffmpeg.wait();
+        let stderr = handle.join().unwrap_or_default();
+        match stderr.trim() {
+            "" => Err(e),
+            s  => Err(e.context(format!("ffmpeg: {s}"))),
+        }
+    };
+
     let y4m_dec = match y4m::decode(reader).context("init y4m decoder") {
         Ok(d) => d,
-        Err(e) => { let _ = ffmpeg.kill(); let _ = ffmpeg.wait(); return Err(e); }
+        Err(e) => return abort(ffmpeg, stderr_handle, e),
     };
     let decoder_impl = av_decoders::DecoderImpl::Y4m(y4m_dec);
     let mut decoder = match av_decoders::Decoder::from_decoder_impl(decoder_impl)
         .context("create decoder")
     {
         Ok(d) => d,
-        Err(e) => { let _ = ffmpeg.kill(); let _ = ffmpeg.wait(); return Err(e); }
+        Err(e) => return abort(ffmpeg, stderr_handle, e),
     };
 
     let speed = match cfg.speed {
@@ -91,13 +106,31 @@ fn run_detection(
     };
 
     let results = av_scenechange::detect_scene_changes::<u8>(&mut decoder, opts, None, None);
-    let _ = ffmpeg.kill();
-    let _ = ffmpeg.wait();
+
+    // Close the read end first, or waiting on an undrained writer hangs for good.
+    drop(decoder);
+
+    // On error ffmpeg may still be mid-write, and only a kill gets us out of the wait.
+    let status = match &results {
+        Ok(_) => ffmpeg.wait().context("wait for ffmpeg")?,
+        Err(_) => {
+            let _ = ffmpeg.kill();
+            ffmpeg.wait().context("wait for ffmpeg")?
+        }
+    };
     let ffmpeg_stderr = stderr_handle.join().unwrap_or_default();
+    let results = results.context("av-scenechange failed")?;
+
+    // A truncated Y4M stream reaches the detector as a clean end of input.
+    if !status.success() {
+        bail!(
+            "ffmpeg failed during scene detection ({status}):\n{}",
+            ffmpeg_stderr.trim()
+        );
+    }
     if !ffmpeg_stderr.is_empty() {
         tracing::warn!("ffmpeg scene detection: {}", ffmpeg_stderr.trim());
     }
-    let results = results.context("av-scenechange failed")?;
 
     if results.frame_count == 0 {
         bail!("scene detection: no frames processed");

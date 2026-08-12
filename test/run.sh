@@ -32,6 +32,9 @@ for arg in "$@"; do
         -h|--help)
             sed -n '2,15p' "$0" | sed 's/^# //; s/^#//'
             exit 0 ;;
+        # Anything else is a filter, but a mistyped flag must not become one: it would
+        # match no suite and the run would report success without testing anything.
+        -*)         printf "ERROR: unknown option %s\n" "$arg" >&2; exit 2 ;;
         *)          FILTER="$arg" ;;
     esac
 done
@@ -106,6 +109,17 @@ $FF -f lavfi -i "color=c=purple:size=640x360:rate=24" \
     -c:a:1 ac3 -b:a:1 192k -metadata:s:a:1 language=deu \
     -c:a:2 aac -b:a:2 96k  -metadata:s:a:2 language=jpn \
     sdr_multiaudio.mkv
+
+echo "  sdr_untagged.mp4"
+# MP4, so the untagged audio track comes back from ffprobe as language "und" rather
+# than as no tag at all. A whitelist must not strip it: that would leave a finished
+# file with no audio, and the container is the only difference from the mkv case.
+$FF -f lavfi -i "color=c=teal:size=640x360:rate=24" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+    -t 10 -map 0:v -map 1:a \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+    -c:a aac -b:a 96k \
+    sdr_untagged.mp4
 
 echo "  sdr_71audio.mkv"
 $FF -f lavfi -i "color=c=navy:size=640x360:rate=24" \
@@ -206,5 +220,13 @@ else
     printf "=== Summary: ${GREEN}%d passed${NC}, ${RED}%d failed${NC} ===\n" "$PASS" "$FAIL"
 fi
 printf "\n"
+
+# A run that executed nothing is not a passing run.
+if [ "$((PASS + FAIL))" -eq 0 ]; then
+    printf "${RED}ERROR:${NC} no test case ran"
+    [ -n "$FILTER" ] && printf " (filter '%s' matched nothing)" "$FILTER"
+    printf "\n"
+    exit 2
+fi
 
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

@@ -99,4 +99,37 @@ AVXS_LOGS=$(docker logs "$CID" 2>&1) || true
 docker rm -f "$CID" >/dev/null 2>&1 || true
 assert_log_contains "invalid value"
 
+# -- two files sharing a stem: neither runs -----------------------------------
+# Same output, same temp dir, same name under processed/.
+I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/a" "$I/b" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/a/test.mkv"
+cp "$FIXTURES_DIR/sdr_720p.mkv"   "$I/b/test.mkv"
+for p in a b; do
+cat > "$I/$p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+EOF
+done
+run_avxs_timed "$I" "$O" 20 "share this name"
+assert_file_not_exists "$O/test.mkv"
+assert_file_exists     "$I/a/test.mkv"
+assert_file_exists     "$I/b/test.mkv"
+assert_log_contains    "share this name"
+
+# -- same stem, different extension, in one profile ---------------------------
+I="$WORKDIR/8/in"; O="$WORKDIR/8/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mp4"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+EOF
+run_avxs_timed "$I" "$O" 20 "share this name"
+assert_file_not_exists "$O/test.mkv"
+assert_log_contains    "share this name"
+
 test_done

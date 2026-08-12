@@ -9,8 +9,7 @@ use crate::ffms2::{Crop, OpenOpts, VideoSource};
 use crate::ext::external_bin;
 use crate::resume::SceneEntry;
 
-/// Per-call CRF/preset overrides (target quality probes and final encode).
-/// CRF is fractional: the SVT-AV1 encoders accept 0.25 steps.
+/// Per-call overrides; CRF is fractional, the SVT-AV1 encoders accept 0.25 steps.
 #[derive(Default, Clone, Copy)]
 pub struct EncodeOverrides {
     pub crf: Option<f64>,
@@ -96,20 +95,26 @@ fn encode_direct(
         .spawn()
         .with_context(|| format!("start encoder '{encoder_name}'"))?;
 
+    // A progress line per frame: a full stderr pipe deadlocks it against the Y4M writer.
+    let mut enc_err = child.stderr.take().expect("encoder stderr unavailable");
+    let err_t = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = enc_err.read_to_string(&mut s);
+        s
+    });
+
     let mut stdin = BufWriter::with_capacity(256 * 1024, child.stdin.take().expect("encoder stdin unavailable"));
-    if let Err(e) = vs.write_y4m_range(&mut stdin, scene.start_frame, scene.end_frame, crop) {
-        drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e.context("write Y4M frames to encoder"));
-    }
+    let write_res = vs.write_y4m_range(&mut stdin, scene.start_frame, scene.end_frame, crop);
     drop(stdin);
 
-    let out = child.wait_with_output().context("wait for encoder")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    let status = child.wait().context("wait for encoder")?;
+    let stderr = err_t.join().unwrap_or_default();
+
+    // Status first: an encoder that died early turns the write into a broken pipe.
+    if !status.success() {
         bail!("encoder failed (chunk {:05}):\n{stderr}", scene.index + 1);
     }
+    write_res.context("write Y4M frames to encoder")?;
     Ok(())
 }
 
@@ -161,13 +166,14 @@ fn encode_scaled(
     let ff_stderr  = ff_err_t.join().unwrap_or_default();
     let enc_stderr = enc_err_t.join().unwrap_or_default();
 
-    write_res.context("write Y4M frames to ffmpeg scaler")?;
+    // Status first: a scaler or encoder that died early turns the write into a broken pipe.
     if !ff_status.success() {
         bail!("ffmpeg scaler failed (chunk {:05}):\n{ff_stderr}", scene.index + 1);
     }
     if !enc_status.success() {
         bail!("encoder failed (chunk {:05}):\n{enc_stderr}", scene.index + 1);
     }
+    write_res.context("write Y4M frames to ffmpeg scaler")?;
     Ok(())
 }
 
@@ -207,8 +213,7 @@ fn build_encoder_args(config: &Config, output_path: &Path, opts: &EncodeOptions)
     Ok(args)
 }
 
-/// Encoder args from config, merged with auto-HDR and auto-keyint.
-/// Auto-args are skipped when the same key is already in `encoder_params` (user override wins).
+/// Config args plus auto-HDR and auto-keyint, unless `encoder_params` already has the key.
 pub fn merged_encoder_args(config: &Config, opts: &EncodeOptions) -> Vec<String> {
     let mut args = config.encoder_args();
 
@@ -234,18 +239,75 @@ pub fn merged_encoder_args(config: &Config, opts: &EncodeOptions) -> Vec<String>
     args
 }
 
-pub async fn validate_output(path: &Path) -> Result<()> {
-    let out = tokio::process::Command::new(external_bin("ffprobe"))
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .output()
-        .await
-        .context("start ffprobe for output validation")?;
+/// Readable, and holding `expected_frames` when avxs encoded it (None for `video = copy`).
+pub async fn validate_output(path: &Path, expected_frames: Option<u64>) -> Result<()> {
+    const TIMEOUT_SECS: u64 = 300;
+
+    let mut cmd = tokio::process::Command::new(external_bin("ffprobe"));
+    cmd.args(["-v", "error", "-i"]).arg(path);
+    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffprobe output validation")
+        .await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("output file is invalid: {stderr}");
     }
+
+    // A merge that lost a chunk is valid Matroska that ends early.
+    if let Some(expected) = expected_frames {
+        let actual = video_packet_count(path).await?;
+        if actual != expected {
+            bail!(
+                "output holds {actual} video frames, but the chunk list accounts for \
+                 {expected}. The merged video is short - delete the job's temp dir to \
+                 encode it again from scratch."
+            );
+        }
+    }
     Ok(())
+}
+
+/// Video frames in a muxed file. One ffprobe pass over the container, no decoding.
+async fn video_packet_count(path: &Path) -> Result<u64> {
+    #[derive(serde::Deserialize)]
+    struct Root { streams: Vec<Stream> }
+    #[derive(serde::Deserialize)]
+    struct Stream { nb_read_packets: Option<String> }
+
+    // Walks the container, so the header-sized default would kill it on long encodes.
+    const TIMEOUT_SECS: u64 = 3600;
+
+    let root: Root = crate::ext::ffprobe_json_with_timeout(
+        &["-v", "error", "-select_streams", "v:0", "-count_packets",
+          "-show_entries", "stream=nb_read_packets", "-of", "json"],
+        path,
+        TIMEOUT_SECS,
+    )
+    .await
+    .context("count the output's video frames")?;
+
+    root.streams
+        .into_iter()
+        .next()
+        .and_then(|s| s.nb_read_packets)
+        .and_then(|s| s.parse().ok())
+        .context("ffprobe reported no video frame count for the output")
+}
+
+/// Absolute, because the demuxer resolves against the list file's own directory, and
+/// escaped for the concat parser, not the shell.
+fn concat_entry(path: &Path) -> Result<String> {
+    let abs = std::path::absolute(path)
+        .with_context(|| format!("absolute path for {}", path.display()))?;
+    let path_str = abs.to_str()
+        .with_context(|| format!("non-UTF8 chunk path: {}", abs.display()))?;
+    let escaped: String = path_str
+        .chars()
+        .flat_map(|c| {
+            let escape = matches!(c, '\\' | '\'' | '"' | ' ' | '\t' | '#');
+            escape.then_some('\\').into_iter().chain(std::iter::once(c))
+        })
+        .collect();
+    Ok(format!("file {escaped}"))
 }
 
 pub async fn concat_chunks(
@@ -253,31 +315,25 @@ pub async fn concat_chunks(
     output_path: &Path,
     list_dir: &Path,
 ) -> Result<()> {
+    // Generous: a stream copy of the whole video. It bounds a wedge, not the runtime.
+    const TIMEOUT_SECS: u64 = 3600;
+
     let list_path = list_dir.join("concat_list.txt");
 
     {
         let mut f = std::fs::File::create(&list_path).context("create concat_list.txt")?;
         for p in chunk_paths {
-            let path_str = p.to_str()
-                .with_context(|| format!("non-UTF8 chunk path: {}", p.display()))?;
-            // ffmpeg concat parser: backslash-escape special chars (not shell semantics).
-            let escaped = path_str
-                .replace('\\', "\\\\")
-                .replace(' ',  "\\ ")
-                .replace('\'', "\\'");
-            writeln!(f, "file {escaped}").context("write concat_list.txt")?;
+            writeln!(f, "{}", concat_entry(p)?).context("write concat_list.txt")?;
         }
     }
 
-    let out = tokio::process::Command::new(external_bin("ffmpeg"))
-        .args(["-hide_banner", "-loglevel", "error", "-y"])
+    let mut cmd = tokio::process::Command::new(external_bin("ffmpeg"));
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(["-f", "concat", "-safe", "0", "-i"])
         .arg(&list_path)
         .args(["-c:v", "copy", "-map_metadata", "-1", "-an", "-sn"])
-        .arg(output_path)
-        .output()
-        .await
-        .context("start ffmpeg concat")?;
+        .arg(output_path);
+    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmpeg concat").await?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -298,6 +354,17 @@ mod tests {
 
     fn cfg(encoder_params: HashMap<String, toml::Value>) -> Config {
         Config { encoder: Some(Encoder::SvtAv1), encoder_params, ..Default::default() }
+    }
+
+    #[test]
+    fn concat_entry_is_absolute_and_escaped() {
+        // A relative chunk path would be resolved against the list file's own directory.
+        let line = concat_entry(Path::new("output/.avxs_a/chunks/00001.ivf")).unwrap();
+        let path = line.strip_prefix("file ").unwrap();
+        assert!(path.starts_with('/'), "not absolute: {line}");
+
+        let line = concat_entry(Path::new("/tmp/Movie \"Title\" #1/c.ivf")).unwrap();
+        assert_eq!(line, "file /tmp/Movie\\ \\\"Title\\\"\\ \\#1/c.ivf");
     }
 
     #[test]
@@ -323,7 +390,6 @@ mod tests {
         let out = PathBuf::from("/tmp/chunk.ivf");
         let args = build_encoder_args(&config, &out, &opts).unwrap();
 
-        // Manual keyint=240 wins; auto 120 must not appear.
         let keyint_pos = args.iter().position(|a| a == "--keyint").unwrap();
         assert_eq!(args[keyint_pos + 1], "240");
         assert_eq!(args.iter().filter(|a| *a == "--keyint").count(), 1);
@@ -343,7 +409,6 @@ mod tests {
 
     #[test]
     fn auto_hdr_skipped_when_manual_override() {
-        // User pinned color-primaries; auto-HDR must not override.
         let config = cfg(params(&[("color-primaries", 1)]));
         let opts = EncodeOptions {
             hdr_args: vec![
@@ -356,11 +421,9 @@ mod tests {
         };
 
         let args = merged_encoder_args(&config, &opts);
-        // User's value 1 wins for color-primaries.
         let pos = args.iter().position(|a| a == "--color-primaries").unwrap();
         assert_eq!(args[pos + 1], "1");
         assert_eq!(args.iter().filter(|a| *a == "--color-primaries").count(), 1);
-        // Non-overridden auto-HDR arg still injected.
         assert!(args.windows(2).any(|w| w[0] == "--transfer-characteristics" && w[1] == "16"));
     }
 }

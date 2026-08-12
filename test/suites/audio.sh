@@ -174,6 +174,22 @@ assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
 
+# -- untagged in MP4: ffprobe reports "und", which still means untagged -------
+# Reading only Matroska's missing field as untagged leaves an MP4 rip with no audio.
+I="$WORKDIR/20/in"; O="$WORKDIR/20/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_untagged.mp4" "$I/p/test.mp4"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[audio]
+mode               = "copy"
+language_whitelist = ["fra"]
+EOF
+run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "und track: no output"
+assert_audio_track_count "$O/test.mkv" 1
+
 # -- lossless override: flac source to flac, no bitrate, options applied --------
 I="$WORKDIR/11/in"; O="$WORKDIR/11/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_71audio.mkv" "$I/p/test.mkv"

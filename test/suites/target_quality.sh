@@ -1,8 +1,6 @@
 #!/bin/sh
-# Tests for target_quality. CVVDP runs on the GPU via FFVship and target_quality
-# requires one; a headless CI runner has no GPU, so we verify the clear error path
-# here. The actual CVVDP search (probe -> measure -> solve) is covered by the Rust
-# unit tests and exercised manually on a GPU.
+# Tests for target_quality. A CI runner has no GPU, so only the error path is checked
+# here; the CVVDP search itself is covered by the Rust unit tests.
 . "$(dirname "$0")/../lib.sh"
 
 WORKDIR=$(mktemp -d)
@@ -19,7 +17,11 @@ preset = 12
 jod = 9.5
 EOF
 run_avxs_timed "$I" "$O" 90 "requires a GPU"
-assert_log_contains "requires a GPU"
+
+# "requires a GPU" alone also covers FFVship failing to start, so a broken bundle would
+# keep this green. This wording needs FFVship to have run and enumerated a device.
+assert_log_contains "found only a software Vulkan device"
+assert_log_contains "llvmpipe"
 assert_file_not_exists "$O/test.mkv"
 
 test_done

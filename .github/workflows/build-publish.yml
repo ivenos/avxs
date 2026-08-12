@@ -11,22 +11,36 @@ on:
 env:
   GITHUB_IMAGE: ghcr.io/ivenos/avxs
   DOCKERHUB_IMAGE: ivenos/avxs
+  # Kept in lockstep with the Dockerfile and appimage.yml by Renovate.
+  RUST_VERSION: "1.97.1"
 
-# Least privilege by default; jobs that publish opt into more below.
+# Jobs that publish opt into more below.
 permissions:
   contents: read
+
+# Two pushes to main would otherwise race to move the same :dev tag.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
+      # The version the image builds with, not `stable`: a newly stabilised API would
+      # pass here and fail 25 minutes later inside the image build.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
 
       - name: Install dependencies
-        run: sudo apt-get install -y libffms2-dev nasm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffms2-dev nasm
 
       - name: Run unit tests
         run: cargo test --locked
@@ -34,7 +48,7 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     needs: test
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -43,8 +57,66 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Not test/run.sh's own build: without the layer cache, SVT-AV1, FFMS2 and Vship
+      # eat the timeout before the first test runs.
+      - name: Build test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: avxs:test
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
+
       - name: Run integration tests
-        run: ./test/run.sh
+        run: ./test/run.sh --no-build
+
+  # The arm64 side of what the integration job proves for amd64. On pushes too: changes
+  # land as direct pushes to main, and a PR-only job would miss them.
+  build-arm64:
+    name: Build arm64 (no push)
+    needs: [test, integration]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: avxs:arm64
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+
+      # Compiling proves nothing about a binary that aborts under aarch64 musl, or a
+      # library missing from the runtime stage.
+      - name: Every bundled tool starts
+        run: |
+          docker run --rm --entrypoint sh avxs:arm64 -c '
+            set -e
+            ffmpeg   -hide_banner -version >/dev/null
+            ffprobe  -hide_banner -version >/dev/null
+            mkvmerge --version             >/dev/null
+            SvtAv1EncApp     --version     >/dev/null
+            SvtAv1EncApp-hdr --version     >/dev/null
+            # ffmsindex exits non-zero without arguments; the usage text proves it loaded.
+            # Piping it into head only ever reports on head.
+            ffmsindex 2>&1 | grep -qi usage
+            FFVship --list-gpu             >/dev/null
+            # avxs is a daemon and takes no arguments, so `avxs --version` would run the
+            # scan loop until this job times out.
+            timeout -s KILL 10 avxs >/tmp/start.log 2>&1 || true
+            grep -q "avxs started" /tmp/start.log
+          '
 
   build:
     needs: [test, integration]
@@ -117,6 +189,8 @@ jobs:
   push:
     runs-on: ubuntu-latest
     needs: build
+    # The tag rules below produce nothing off main or a tag, leaving imagetools no -t.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
       packages: write
@@ -159,7 +233,8 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            # Stable only: a `v1.2.0-rc1` would otherwise move :latest.
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-') }}
 
       - name: Create and push multi-arch manifest to GHCR
         working-directory: /tmp/digests

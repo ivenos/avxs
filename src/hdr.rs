@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -9,8 +9,12 @@ pub struct HdrInfo {
     pub transfer_characteristics: Option<u32>,
     pub matrix_coefficients: Option<u32>,
     pub chroma_sample_position: Option<u32>,
+    /// Only set for full range. Studio is the encoder default and the common case.
+    pub color_range: Option<u32>,
     pub content_light_level: Option<String>,
     pub mastering_display: Option<String>,
+    /// Dolby Vision profile from the DOVI configuration record, when there is one.
+    pub dv_profile: Option<u32>,
 }
 
 impl HdrInfo {
@@ -31,6 +35,9 @@ impl HdrInfo {
         }
         if let Some(csp) = self.chroma_sample_position {
             args.extend_from_slice(&["--chroma-sample-position".into(), csp.to_string()]);
+        }
+        if let Some(cr) = self.color_range {
+            args.extend_from_slice(&["--color-range".into(), cr.to_string()]);
         }
         if let Some(ref cll) = self.content_light_level {
             args.extend_from_slice(&["--content-light".into(), cll.clone()]);
@@ -60,6 +67,11 @@ struct ProbeStream {
     color_space: String,
     #[serde(default)]
     chroma_location: String,
+    #[serde(default)]
+    color_range: String,
+    /// Where the Dolby Vision configuration record lives, unlike the frame side data.
+    #[serde(default)]
+    side_data_list: Vec<SideData>,
 }
 
 #[derive(Deserialize)]
@@ -86,15 +98,19 @@ struct SideData {
     white_point_y: Option<serde_json::Value>,
     min_luminance: Option<serde_json::Value>,
     max_luminance: Option<serde_json::Value>,
+    // Dolby Vision configuration record
+    dv_profile: Option<serde_json::Value>,
 }
 
 pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
-    let probe: ProbeOutput = match crate::ext::ffprobe_json(
+    let probe: ProbeOutput = crate::ext::ffprobe_json(
         &[
             "-v", "error",
             "-select_streams", "v:0",
             "-read_intervals", "%+#1",
-            "-show_entries", "stream=color_primaries,color_transfer,color_space,chroma_location",
+            "-show_entries", "stream=color_primaries,color_transfer,color_space,chroma_location,color_range",
+            // Sections accumulate, so this does not replace the two around it.
+            "-show_entries", "stream_side_data=dv_profile",
             "-show_frames",
             "-show_entries", "frame=side_data_list",
             "-print_format", "json",
@@ -102,13 +118,8 @@ pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
         source_file,
     )
     .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("ffprobe HDR detection failed: {e:#}");
-            return Ok(HdrInfo::default());
-        }
-    };
+    // Only called when the profile asks for HDR, so "no metadata" is not an answer here.
+    .context("HDR detection")?;
 
     let stream = probe.streams.into_iter().next().unwrap_or_default();
 
@@ -117,6 +128,7 @@ pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
         transfer_characteristics: map_transfer(&stream.color_transfer),
         matrix_coefficients: map_matrix(&stream.color_space),
         chroma_sample_position: map_chroma(&stream.chroma_location),
+        color_range: map_color_range(&stream.color_range),
         ..Default::default()
     };
 
@@ -128,9 +140,15 @@ pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
         side_data.iter().any(|s| s.side_data_type.to_lowercase().contains(needle))
     };
 
-    info.hdr_type = if has_side_type("dovi") || has_side_type("dolby") {
+    info.dv_profile = stream
+        .side_data_list
+        .iter()
+        .find_map(|s| s.dv_profile.as_ref())
+        .map(|v| val_to_i64(v) as u32);
+
+    info.hdr_type = if info.dv_profile.is_some() || has_side_type("dolby") {
         "Dolby Vision".into()
-    } else if has_side_type("hdr10+") || has_side_type("hdr_dynamic") {
+    } else if has_side_type("hdr10+") {
         "HDR10+".into()
     } else if stream.color_transfer == "smpte2084" {
         "HDR10".into()
@@ -198,18 +216,19 @@ fn map_color_primaries(s: &str) -> Option<u32> {
     })
 }
 
+/// libavutil's names, not the AV1 spec's: `bt470m`, `bt470bg`, `log100`, `log316`, `bt1361e`.
 fn map_transfer(s: &str) -> Option<u32> {
     Some(match s {
         "bt709"        => 1,
-        "gamma22"      => 4,
-        "gamma28"      => 5,
+        "bt470m"       => 4,
+        "bt470bg"      => 5,
         "smpte170m"    => 6,
         "smpte240m"    => 7,
         "linear"       => 8,
-        "log"          => 9,
-        "log_sqrt"     => 10,
+        "log100"       => 9,
+        "log316"       => 10,
         "iec61966-2-4" => 11,
-        "bt1361"       => 12,
+        "bt1361e"      => 12,
         "iec61966-2-1" => 13,
         "bt2020-10"    => 14,
         "bt2020-12"    => 15,
@@ -239,14 +258,21 @@ fn map_matrix(s: &str) -> Option<u32> {
     })
 }
 
-// SVT-AV1 --chroma-sample-position: 0=unknown, 1=vertical (left), 2=colocated (topleft).
-// Other ffprobe locations have no AV1 equivalent.
+// SVT-AV1: 0=unknown, 1=vertical (left), 2=colocated (topleft); the rest has no AV1 form.
 fn map_chroma(s: &str) -> Option<u32> {
     Some(match s {
         "left"    => 1,
         "topleft" => 2,
         _         => return None,
     })
+}
+
+// SVT-AV1: 0=studio, 1=full. Studio is the default, so only full needs signalling.
+fn map_color_range(s: &str) -> Option<u32> {
+    match s {
+        "pc" | "full" => Some(1),
+        _             => None,
+    }
 }
 
 fn val_to_f64(v: &serde_json::Value) -> f64 {
@@ -324,6 +350,39 @@ mod tests {
             "--color-primaries", "9",
             "--transfer-characteristics", "16",
         ]);
+    }
+
+    #[test]
+    fn transfer_uses_the_names_ffprobe_actually_prints() {
+        // Verified against ffprobe 8.1; these five differ from the AV1 spec spelling.
+        assert_eq!(map_transfer("bt470m"),  Some(4));
+        assert_eq!(map_transfer("bt470bg"), Some(5));
+        assert_eq!(map_transfer("log100"),  Some(9));
+        assert_eq!(map_transfer("log316"),  Some(10));
+        assert_eq!(map_transfer("bt1361e"), Some(12));
+
+        assert_eq!(map_transfer("gamma22"), None);
+        assert_eq!(map_transfer("log"),     None);
+        assert_eq!(map_transfer("unknown"), None);
+    }
+
+    #[test]
+    fn dv_profile_is_read_from_stream_side_data() {
+        // The frame side data carries the RPU but no profile number.
+        let json = r#"{
+            "streams": [{
+                "color_transfer": "smpte2084",
+                "side_data_list": [{"side_data_type": "DOVI configuration record",
+                                    "dv_profile": 5}]
+            }],
+            "frames": [{"side_data_list": [{"side_data_type": "Dolby Vision RPU Data"}]}]
+        }"#;
+        let probe: ProbeOutput = serde_json::from_str(json).unwrap();
+        let stream = probe.streams.into_iter().next().unwrap();
+        let profile = stream.side_data_list.iter()
+            .find_map(|s| s.dv_profile.as_ref())
+            .map(|v| val_to_i64(v) as u32);
+        assert_eq!(profile, Some(5));
     }
 
     #[test]

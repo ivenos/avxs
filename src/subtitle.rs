@@ -29,9 +29,11 @@ pub async fn select_tracks(source: &Path, config: &SubtitleConfig) -> Result<Sub
 
     let probe = probe_subtitle_langs(source).await?;
     let indices: Vec<usize> = probe.streams.iter().enumerate()
-        .filter(|(_, s)| match &s.tags.language {
-            None       => true,
-            Some(lang) => config.language_whitelist.iter().any(|w| w == lang),
+        .filter(|(_, s)| {
+            crate::config::language_selected(
+                &config.language_whitelist,
+                s.tags.language.as_deref(),
+            )
         })
         .map(|(i, _)| i)
         .collect();
@@ -58,12 +60,9 @@ async fn probe_subtitle_langs(source: &Path) -> Result<SubProbe> {
 }
 
 pub(crate) async fn probe_track_ids(source: &Path, subtitle_indices: &[usize]) -> Result<Vec<u64>> {
-    let out = Command::new(external_bin("mkvmerge"))
-        .args(["--identify", "--identification-format", "json"])
-        .arg(source)
-        .output()
-        .await
-        .context("mkvmerge --identify")?;
+    let mut cmd = Command::new(external_bin("mkvmerge"));
+    cmd.args(["--identify", "--identification-format", "json"]).arg(source);
+    let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify").await?;
 
     if out.status.code().unwrap_or(2) >= 2 {
         let stderr = String::from_utf8_lossy(&out.stderr);

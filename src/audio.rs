@@ -1,15 +1,14 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 
 use crate::config::{AudioConfig, AudioMode, layout_name, output_is_lossless, toml_value_to_arg};
 use crate::ext::external_bin;
 
-// Only libopus-native layouts, so aformat remaps e.g. 5.1(side) -> 5.1 without
-// dropping channels. Other codecs keep the source layout.
+// libopus-native layouts only, so aformat remaps 5.1(side) instead of dropping channels.
 const OPUS_CHANNEL_LAYOUTS: &str =
     "aformat=channel_layouts=7.1|6.1|5.1|5.0|quad|3.0|stereo|mono";
 
@@ -20,7 +19,9 @@ struct FfprobeOutput {
 
 #[derive(Deserialize)]
 struct FfprobeStream {
-    codec_name: String,
+    /// ffprobe omits this when it cannot identify the codec.
+    #[serde(default)]
+    codec_name: Option<String>,
     #[serde(default)]
     profile: Option<String>,
     #[serde(default)]
@@ -62,11 +63,9 @@ async fn lossless_codecs() -> &'static HashSet<String> {
 }
 
 async fn probe_lossless_codecs() -> Result<HashSet<String>> {
-    let out = Command::new(external_bin("ffmpeg"))
-        .args(["-hide_banner", "-codecs"])
-        .output()
-        .await
-        .context("run ffmpeg -codecs")?;
+    let mut cmd = Command::new(external_bin("ffmpeg"));
+    cmd.args(["-hide_banner", "-codecs"]);
+    let out = crate::ext::output_with_timeout(&mut cmd, 60, "ffmpeg -codecs").await?;
     if !out.status.success() {
         bail!("ffmpeg -codecs exited with failure");
     }
@@ -195,7 +194,7 @@ async fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
         .enumerate()
         .map(|(i, s)| AudioTrack {
             audio_index: i,
-            codec_name: s.codec_name,
+            codec_name: s.codec_name.unwrap_or_else(|| "unknown".into()),
             profile: s.profile,
             channels: s.channels,
             language: s.tags.language,
@@ -204,15 +203,17 @@ async fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
         .collect())
 }
 
+/// Drops a trailing "(Marker)" this function added on an earlier run.
+fn strip_codec_marker<'a>(title: &'a str, marker: &str) -> &'a str {
+    title
+        .strip_suffix(')')
+        .and_then(|t| t.strip_suffix(marker))
+        .and_then(|t| t.strip_suffix('('))
+        .map_or(title, str::trim_end)
+}
+
 fn track_passes_whitelist(track: &AudioTrack, whitelist: &[String]) -> bool {
-    if whitelist.is_empty() {
-        return true;
-    }
-    match &track.language {
-        // no language tag, always keep
-        None => true,
-        Some(lang) => whitelist.iter().any(|w| w == lang),
-    }
+    crate::config::language_selected(whitelist, track.language.as_deref())
 }
 
 enum Action {
@@ -330,10 +331,11 @@ impl AudioPlan {
     }
 }
 
-pub async fn process_plan(source_file: &Path, temp_dir: &Path, plan: &AudioPlan) -> Result<PathBuf> {
-    let audio_path = temp_dir.join("audio.mkv");
+pub async fn process_plan(source_file: &Path, audio_path: &Path, plan: &AudioPlan) -> Result<()> {
     if plan.tracks.is_empty() {
-        return Ok(audio_path);
+        // The muxer only tests whether this file exists.
+        let _ = std::fs::remove_file(audio_path);
+        return Ok(());
     }
 
     let mut cmd = Command::new(external_bin("ffmpeg"));
@@ -362,10 +364,13 @@ pub async fn process_plan(source_file: &Path, temp_dir: &Path, plan: &AudioPlan)
                 for (k, v) in options {
                     cmd.args([format!("-{k}:a:{out_idx}"), v.clone()]);
                 }
-                // keep source name, append codec marker
                 let marker = codec_display(codec);
-                let name = match t.title.as_deref() {
-                    Some(title) if !title.is_empty() => format!("{title} ({marker})"),
+                let name = match t.title.as_deref().map(str::trim) {
+                    // Or re-encoding stacks markers: "Deutsch (Opus) (Opus)".
+                    Some(title) if !title.is_empty() => {
+                        let base = strip_codec_marker(title, marker);
+                        if base.is_empty() { marker.to_string() } else { format!("{base} ({marker})") }
+                    }
                     _ => marker.to_string(),
                 };
                 cmd.args([format!("-metadata:s:a:{out_idx}"), format!("title={name}")]);
@@ -373,15 +378,16 @@ pub async fn process_plan(source_file: &Path, temp_dir: &Path, plan: &AudioPlan)
         }
     }
 
-    cmd.arg(&audio_path);
+    cmd.arg(audio_path);
 
-    let out = cmd.output().await.context("start ffmpeg audio extraction")?;
+    // Transcoding every kept track, so it scales with the runtime of the file.
+    let out = crate::ext::output_with_timeout(&mut cmd, 7200, "ffmpeg audio extraction").await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("ffmpeg audio extraction failed:\n{stderr}");
     }
 
-    Ok(audio_path)
+    Ok(())
 }
 
 pub async fn mux_final(
@@ -394,13 +400,16 @@ pub async fn mux_final(
     let has_audio = audio_path.exists()
         && std::fs::metadata(audio_path).map(|m| m.len()).unwrap_or(0) > 0;
 
-    // Video dispositions come from source (encoded file has none); audio dispositions are already in audio.mkv.
-    let video_disps = probe_dispositions(source_file, "v").await;
+    // video.mkv has none; in copy mode the source has its own and track 0 may be audio.
+    let video_disps = if video_path == source_file {
+        Vec::new()
+    } else {
+        probe_dispositions(source_file, "v").await
+    };
 
     let mut cmd = Command::new(external_bin("mkvmerge"));
     cmd.arg("-o").arg(output_path);
 
-    // Video track: apply dispositions from source, strip everything else
     if let Some(d) = video_disps.first() {
         cmd.args(d.to_mkvmerge_flags(0));
     }
@@ -408,14 +417,12 @@ pub async fn mux_final(
               "--no-global-tags", "--no-track-tags"]);
     cmd.arg(video_path);
 
-    // Audio: dispositions already in audio.mkv
     if has_audio {
         cmd.args(["--no-video", "--no-subtitles", "--no-chapters",
                   "--no-global-tags", "--no-track-tags"]);
         cmd.arg(audio_path);
     }
 
-    // Source: subtitles + chapters only, no tags
     cmd.args(["--no-video", "--no-audio", "--no-global-tags", "--no-track-tags"]);
     match subtitle {
         crate::subtitle::SubtitleSelection::Strip => {
@@ -438,11 +445,19 @@ pub async fn mux_final(
     }
     cmd.arg(source_file);
 
-    let out = cmd.output().await.context("start mkvmerge")?;
+    let out = crate::ext::output_with_timeout(&mut cmd, 3600, "mkvmerge").await?;
     // mkvmerge exits 1 for warnings (non-fatal), 2+ for errors
     if out.status.code().unwrap_or(2) >= 2 {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("mkvmerge failed:\n{stderr}");
+    }
+    // Exit 1 also covers "track skipped: unsupported codec", which silently drops a track.
+    if out.status.code() == Some(1) {
+        let msg = String::from_utf8_lossy(&out.stdout);
+        let warnings: Vec<&str> = msg.lines().filter(|l| l.contains("Warning")).collect();
+        if !warnings.is_empty() {
+            tracing::warn!("mkvmerge: {}", warnings.join(" | "));
+        }
     }
 
     Ok(())
@@ -494,5 +509,13 @@ mod tests {
         assert!(set.contains("dts"));
         assert!(!set.contains("aac"));
         assert!(!set.contains("ffv1"));
+    }
+
+    #[test]
+    fn codec_marker_is_not_stacked_on_reencode() {
+        assert_eq!(strip_codec_marker("Deutsch DD 5.1 (Opus)", "Opus"), "Deutsch DD 5.1");
+        assert_eq!(strip_codec_marker("Deutsch DD 5.1", "Opus"), "Deutsch DD 5.1");
+        assert_eq!(strip_codec_marker("Kommentar (Regie)", "Opus"), "Kommentar (Regie)");
+        assert_eq!(strip_codec_marker("(Opus)", "Opus"), "");
     }
 }

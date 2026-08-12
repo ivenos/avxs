@@ -9,7 +9,7 @@ name = "avxs"
 path = "src/main.rs"
 
 [dependencies]
-tokio              = { version = "1.52",  features = ["rt-multi-thread", "time", "process", "macros", "sync"] }
+tokio              = { version = "1.52",  features = ["rt-multi-thread", "time", "process", "macros", "sync", "signal"] }
 serde              = { version = "1.0",   features = ["derive"] }
 serde_json         = "1.0"
 toml               = "1.1"

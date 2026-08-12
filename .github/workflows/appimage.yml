@@ -12,13 +12,39 @@ env:
   FFMS2_VERSION: "5.0"
   VSHIP_VERSION: v5.1.0
   RUST_VERSION: 1.97.1
+  LINUXDEPLOY_VERSION: 1-alpha-20251107-1
 
-# Least privilege by default; the appimage job opts into contents: write to attach release assets.
+# The appimage job opts into contents: write to attach release assets.
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # A release can be cut from any commit, including one whose tests never ran.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffms2-dev nasm
+
+      - name: Run unit tests
+        run: cargo test --locked
+
   appimage:
+    needs: test
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -36,9 +62,17 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Resolve version
+        # Not interpolated: a tag name is attacker-chosen text and this writes $GITHUB_ENV.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "AVXS_VERSION=${{ github.event.release.tag_name }}" >> "$GITHUB_ENV"
+          set -eu
+          if [ "$EVENT_NAME" = "release" ]; then
+            case "$RELEASE_TAG" in
+              *[!A-Za-z0-9._-]*|"") echo "::error::refusing unusual tag name"; exit 1 ;;
+            esac
+            echo "AVXS_VERSION=$RELEASE_TAG" >> "$GITHUB_ENV"
           else
             echo "AVXS_VERSION=dev-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
           fi
@@ -138,9 +172,11 @@ jobs:
           cp /usr/local/lib/libvship.so       "$APPDIR/usr/lib/"
 
       - name: Build AppImage
+        # A release tag, not "continuous": the same avxs tag has to keep producing the
+        # same artefact.
         run: |
           set -eux
-          curl -fsSLO "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage"
+          curl -fsSLO "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/linuxdeploy-${{ matrix.arch }}.AppImage"
           chmod +x "linuxdeploy-${{ matrix.arch }}.AppImage"
 
           OUTPUT="avxs-${AVXS_VERSION}-${{ matrix.arch }}.AppImage" \
@@ -157,6 +193,31 @@ jobs:
           timeout 10 "$GITHUB_WORKSPACE/avxs-${AVXS_VERSION}-${{ matrix.arch }}.AppImage" 2>&1 | tee smoke.log
           set -e
           grep -q "avxs started" smoke.log
+
+      # avxs logs "avxs started" before touching a tool, so the smoke test above passes
+      # on an AppImage with nothing bundled.
+      - name: Every bundled tool starts
+        run: |
+          set -eux
+          cd /tmp
+          "$GITHUB_WORKSPACE/avxs-${AVXS_VERSION}-${{ matrix.arch }}.AppImage" --appimage-extract >/dev/null
+          BIN="/tmp/squashfs-root/usr/bin"
+
+          "$BIN/ffmpeg"           -hide_banner -version >/dev/null
+          "$BIN/ffprobe"          -hide_banner -version >/dev/null
+          "$BIN/mkvmerge"         --version             >/dev/null
+          "$BIN/SvtAv1EncApp"     --version             >/dev/null
+          "$BIN/SvtAv1EncApp-hdr" --version             >/dev/null
+          # ffmsindex exits non-zero without arguments; the usage text proves it loaded.
+          "$BIN/ffmsindex" 2>&1 | grep -qi usage
+          # No GPU here, so "no device" is success and only a loader error is a failure.
+          # `grep -v` cannot tell them apart: one clean line and it passes.
+          "$BIN/FFVship" --list-gpu >ffvship.log 2>&1 || true
+          if grep -qiE "error relocating|symbol not found|cannot open shared object" ffvship.log; then
+            echo "::error::FFVship did not load"
+            cat ffvship.log
+            exit 1
+          fi
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
